@@ -1,19 +1,43 @@
 --- GLASHAUS PROJECT DUMP ---
-Thu Dec 18 12:13:01 EET 2025
-Structure:
+Thu Dec 18 16:41:31 EET 2025
+
+
+--- GIT HISTORY ---
+* e847d18 (HEAD -> main) feat(backend): complete ORM models, repo pattern, and test suite
+* d266a4d ops: add docker containerization and orchestration
+* 07beab5 feat(scraper): implement simulation mode to bypass WAF during dev
+* 8d13095 chore(scripts): include git log in context dumper
+* 15c8316 refactor(api): connect routes to database via dependency injection
+* 84bff79 feat(db): implement SQLAlchemy ORM models and Repository pattern
+* 648c703 feat(core): implement abstract AI service layer
+* 2e3b2a8 docs: add German functional specification (Lastenheft)
+* 0307ac8 feat: init project structure, docs, and database schema
+
+
+--- FILE STRUCTURE ---
 .
 ./docs
 ./docs/ARCHITECTURE.md
 ./docs/api_contract.yaml
+./docs/LASTENHEFT_DE.md
+./docs/TECHNICAL_DEBT.md
 ./src
 ./src/api
 ./src/api/routes.py
 ./src/core
 ./src/core/config.py
 ./src/services
+./src/services/ai_engine.py
+./src/services/repository.py
+./src/services/scraper_mvp.py
+./src/services/scraper_service.py
+./src/services/risk_engine.py
 ./src/models
 ./src/__init__.py
 ./src/main.py
+./src/db
+./src/db/session.py
+./src/db/models.py
 ./scripts
 ./scripts/context_dump.sh
 ./prompts
@@ -23,6 +47,11 @@ Structure:
 ./README.md
 ./glashaus_context.txt
 ./requirements.txt
+./imot_simulation.html
+./Dockerfile
+./docker-compose.yml
+./tests
+./tests/test_api.py
 
 
 --- FILE CONTENTS ---
@@ -92,35 +121,167 @@ paths:
 
 
 =========================================
+FILE: ./docs/LASTENHEFT_DE.md
+=========================================
+# LASTENHEFT: Projekt Glashaus
+**Version:** 1.0.0
+**Status:** In Entwicklung
+
+## 1. Einleitung
+Das Projekt "Glashaus" ist eine automatisierte Due-Diligence-Plattform für den Immobilienmarkt in Sofia. Ziel ist die Beseitigung von Informationsasymmetrien durch den Einsatz von OSINT und KI-gestützter Datenanalyse.
+
+## 2. Ist-Zustand (Problemstellung)
+- **Datenfragmentierung:** Grundbuch (Registry), Kataster (Cadastre) und Gemeinde agieren in Silos.
+- **Intransparenz:** Immobilienanzeigen enthalten oft ungenaue Flächenangaben und verschleierte Adressen.
+- **Prozessineffizienz:** Manuelle Prüfungen sind teuer und langsam.
+
+## 3. Soll-Zustand (Lösung)
+Ein Microservices-System, das folgende Kernfunktionen bietet:
+1.  **Automatische Adress-Deduktion:** Ermittlung der exakten Adresse aus unstrukturierten Anzeigentexten und Bildern.
+2.  **Soll/Ist-Abgleich:** Automatischer Vergleich von Maklerangaben (Anzeige) mit amtlichen Katasterdaten.
+3.  **Risikobewertung:** Algorithmische Berechnung eines "Risk Scores" (0-100).
+
+## 4. Technische Anforderungen
+- **Architektur:** Event-Driven Microservices (Python/FastAPI).
+- **Datenbank:** PostgreSQL mit PostGIS für Geodatenverarbeitung.
+- **KI-Integration:**
+    - *Tier 1:* Textanalyse (Low Cost / Gemini Flash).
+    - *Tier 2:* Visuelle Analyse (High Cost / Gemini Pro).
+
+## 5. Nicht-funktionale Anforderungen
+- **Idempotenz:** Wiederholte Uploads dürfen keine Datenkorruption verursachen.
+- **Skalierbarkeit:** Das System muss Warteschlangen (Queues) nutzen, um Lastspitzen bei Scrapern abzufangen.
+
+
+=========================================
+FILE: ./docs/TECHNICAL_DEBT.md
+=========================================
+# TECHNICAL DEBT LOG
+
+## Critical Severity (Must Fix Before Beta)
+
+### 1. Database Session Scope in Background Tasks
+- **Location:** `src/api/routes.py` -> `initiate_audit`
+- **Issue:** Passing the dependency-injected `db` session to `BackgroundTasks` causes `DetachedInstanceError` because the session closes when the HTTP response returns.
+- **Fix:** Refactor `process_audit_task` to instantiate a fresh `SessionLocal()` context manager internally.
+- **Reference:** SQLAlchemy Thread-Safety docs.
+
+### 2. AI Service Implementation
+- **Location:** `src/services/ai_engine.py`
+- **Issue:** Currently returns mock dictionary `{"confidence": 0.0}`.
+- **Fix:** 
+    - Initialize `genai.configure(api_key=...)`.
+    - Implement `generate_content` call for Gemini Flash (Text).
+    - Implement `generate_content` with Image inputs for Gemini Pro (Vision).
+    - Add Error Handling for "Safety Filters" or API Quotas.
+
+## Moderate Severity (Logic Gaps)
+
+### 3. Risk Scoring Algorithm
+- **Location:** Database Schema exists (`risk_score`), but logic is missing.
+- **Issue:** No calculator exists to translate discrepancies into a 0-100 integer.
+- **Fix:** Create `src/services/risk_engine.py`.
+    - Base Score: 0
+    - If `advertised_area` > `cadastre_area` (+20 pts).
+    - If `type` mismatch (Atelier vs Apt) (+30 pts).
+    - If `price_per_sqm` > 1.5x avg (+15 pts).
+
+### 4. Hardcoded Secrets
+- **Location:** `src/core/config.py`
+- **Issue:** Default "mock-key" risks silent failure in prod.
+- **Fix:** Implement `pydantic` validation to raise `ValueError` on startup if `GEMINI_API_KEY` is missing in production environment.
+
+## Low Severity (Optimization)
+
+### 5. Listing Normalization
+- **Location:** `src/services/repository.py`
+- **Issue:** Duplicate URLs might occur if query params differ (e.g., `?adv=1` vs `?adv=1&utm=facebook`).
+- **Fix:** Implement a URL cleaner utility to strip tracking parameters before hashing/storing.
+
+
+=========================================
 FILE: ./src/api/routes.py
 =========================================
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, HttpUrl
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+
+from src.db.session import get_db, SessionLocal
+from src.db.models import Listing
+from src.services.repository import RealEstateRepository
+from src.services.scraper_service import ScraperService
+from src.services.ai_engine import GeminiService
+from src.services.risk_engine import RiskEngine
+from src.core.config import settings
 
 router = APIRouter()
 
 class AuditRequest(BaseModel):
-    url: HttpUrl
-
+    url: str
+    price_override: float = 0.0
+    
 class AuditResponse(BaseModel):
-    report_id: str
-    risk_score: int
+    listing_id: int
+    source_url: str
     status: str
+    note: str
+
+async def process_audit_task(listing_id: int):
+    """
+    Background worker that runs the scrape -> AI -> Risk calculation.
+    Uses its own SessionLocal to remain thread-safe.
+    """
+    db = SessionLocal()
+    try:
+        repo = RealEstateRepository(db)
+        scraper = ScraperService(simulation_mode=True)
+        ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
+        risk_engine = RiskEngine()
+
+        listing = db.query(Listing).get(listing_id)
+        if not listing: return
+
+        # Execute Pipeline
+        scraped_data = scraper.scrape_url(listing.source_url)
+        listing.description_raw = scraped_data.get("raw_text", "Scrape failed")
+        db.commit()
+
+        ai_insights = await ai_engine.analyze_text(listing.description_raw)
+        report_data = risk_engine.calculate_score(scraped_data, ai_insights)
+
+        repo.create_report(
+            listing_id=listing.id,
+            risk=report_data["score"],
+            details={"flags": report_data["flags"], "ai_meta": ai_insights},
+            cost=0.04
+        )
+    except Exception as e:
+        print(f"CRITICAL_WORKER_ERROR: {str(e)}")
+    finally:
+        db.close()
 
 @router.post("/audit", response_model=AuditResponse)
-async def initiate_audit(request: AuditRequest):
-    """
-    Receives a Listing URL and triggers the Intelligence Pipeline.
-    """
-    print(f"--> Ingesting Target: {request.url}")
+async def initiate_audit(
+    request: AuditRequest, 
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    repo = RealEstateRepository(db)
     
-    # TODO: Connect to Redis Queue here
-    # TODO: Connect to Scraper Service
+    listing = repo.create_listing(
+        url=str(request.url),
+        price=request.price_override, 
+        area=0.0, 
+        desc="Pending Processing"
+    )
+    
+    background_tasks.add_task(process_audit_task, listing.id)
     
     return {
-        "report_id": "REQ-12345", 
-        "risk_score": 0, 
-        "status": "PROCESSING_STARTED"
+        "listing_id": listing.id,
+        "source_url": listing.source_url,
+        "status": "QUEUED",
+        "note": "The Siege Tower is advancing."
     }
 
 
@@ -133,16 +294,262 @@ class Settings:
     PROJECT_NAME: str = "Glashaus"
     VERSION: str = "0.1.0"
     
-    # Database
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "mock-key")
+
     POSTGRES_USER: str = os.getenv("POSTGRES_USER", "postgres")
-    POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "changeme")
-    POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "localhost")
+    POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "")
     POSTGRES_DB: str = os.getenv("POSTGRES_DB", "glashaus")
+    POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "postgres")
     
-    # AI Keys
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    @property
+    def DATABASE_URL(self) -> str:
+        if not self.POSTGRES_SERVER:
+            return "sqlite:///./glashaus.db"
+        return f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}/{self.POSTGRES_DB}"
 
 settings = Settings()
+
+if settings.GEMINI_API_KEY == "mock-key":
+    print("--- WARNING: GEMINI_API_KEY is not set. Using MOCK mode. ---")
+
+
+=========================================
+FILE: ./src/services/ai_engine.py
+=========================================
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+import google.generativeai as genai
+from src.core.config import settings
+
+class AIEngineInterface(ABC):
+    @abstractmethod
+    async def analyze_text(self, text: str) -> Dict[str, Any]:
+        pass
+
+    @abstractmethod
+    async def analyze_images(self, image_urls: list[str]) -> Dict[str, Any]:
+        pass
+
+class GeminiService(AIEngineInterface):
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        if api_key != "mock-key":
+            genai.configure(api_key=self.api_key)
+            self.model_flash = genai.GenerativeModel('gemini-1.5-flash')
+            self.model_pro = genai.GenerativeModel('gemini-1.5-pro')
+        else:
+            self.model_flash = None
+            self.model_pro = None
+    
+    async def analyze_text(self, text: str) -> Dict[str, Any]:
+        if not self.model_flash:
+            return {"address_found": False, "confidence": 0.0, "entities": {}}
+        
+        prompt = f"Analyze listing text for: Street, Neighborhood, Floor, and Net Area. Text: {text}"
+        try:
+            response = self.model_flash.generate_content(prompt)
+            return {"raw_ai_output": response.text, "confidence": 0.9}
+        except Exception as e:
+            return {"error": str(e), "confidence": 0.0}
+
+    async def analyze_images(self, image_urls: list[str]) -> Dict[str, Any]:
+        return {"building_id": "UNKNOWN", "risk_factors": ["Vision implementation pending"]}
+
+
+=========================================
+FILE: ./src/services/repository.py
+=========================================
+from sqlalchemy.orm import Session
+from src.db.models import Listing, Report
+from typing import Optional
+
+class RealEstateRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def create_listing(self, url: str, price: float, area: float, desc: str) -> Listing:
+        """
+        Idempotent creation: If URL exists, return existing.
+        """
+        existing = self.get_listing_by_url(url)
+        if existing:
+            return existing
+            
+        new_listing = Listing(
+            source_url=url,
+            price_bgn=price,
+            advertised_area_sqm=area,
+            description_raw=desc
+        )
+        self.db.add(new_listing)
+        self.db.commit()
+        self.db.refresh(new_listing)
+        return new_listing
+
+    def get_listing_by_url(self, url: str) -> Optional[Listing]:
+        return self.db.query(Listing).filter(Listing.source_url == url).first()
+
+    def create_report(self, listing_id: int, risk: int, details: dict, cost: float) -> Report:
+        report = Report(
+            listing_id=listing_id,
+            risk_score=risk,
+            discrepancy_details=details,
+            cost_to_generate=cost
+        )
+        self.db.add(report)
+        self.db.commit()
+        self.db.refresh(report)
+        return report
+
+
+=========================================
+FILE: ./src/services/scraper_mvp.py
+=========================================
+from bs4 import BeautifulSoup
+import os
+
+# CONFIG
+SIMULATION_MODE = True
+MOCK_FILE = "imot_simulation.html"
+
+def run_recon():
+    print("[*] INTEL: Starting Reconnaissance Protocol...")
+    
+    html_content = ""
+    
+    if SIMULATION_MODE:
+        print(f"[*] MODE: SIMULATION (Bypassing WAF)")
+        if not os.path.exists(MOCK_FILE):
+            print(f"[!] Error: Mock file {MOCK_FILE} not found.")
+            return
+            
+        with open(MOCK_FILE, "r", encoding="utf-8") as f:
+            html_content = f.read()
+    else:
+        # Network logic removed for Termux Safety
+        pass
+
+    soup = BeautifulSoup(html_content, 'html.parser')
+    links = soup.find_all('a', href=True)
+    
+    print("[*] Parsing DOM Structure...")
+    
+    count = 0
+    listings_found = []
+    
+    for link in links:
+        href = link['href']
+        
+        if 'act=5' in href:
+            # Normalize URL
+            full_url = "https:" + href if href.startswith("//") else href
+            
+            if full_url in listings_found:
+                continue
+                
+            listings_found.append(full_url)
+            text_content = link.get_text(separator=" ", strip=True)
+            
+            count += 1
+            print(f"\n[TARGET #{count}]")
+            print(f"   URL: {full_url}")
+            print(f"   RAW: {text_content}")
+
+    print(f"\n[*] Mission Complete. {count} mock targets extracted.")
+
+if __name__ == "__main__":
+    run_recon()
+
+
+=========================================
+FILE: ./src/services/scraper_service.py
+=========================================
+from bs4 import BeautifulSoup
+import os
+
+class ScraperService:
+    def __init__(self, simulation_mode=True):
+        self.simulation = simulation_mode
+        self.mock_file = "imot_simulation.html"
+
+    def scrape_url(self, url: str) -> dict:
+        """
+        Simulates extracting data from a specific URL.
+        Returns a Dictionary of listing data.
+        """
+        print(f"[SCRAPER] Target: {url}")
+        
+        # 1. Load HTML (Mock or Real)
+        html_content = ""
+        if self.simulation:
+            if not os.path.exists(self.mock_file):
+                # Fallback if file missing
+                return {"error": "Mock file missing"}
+            with open(self.mock_file, "r", encoding="utf-8") as f:
+                html_content = f.read()
+        
+        # 2. Parse
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # 3. Simulate finding the SPECIFIC ad requested
+        # In a real scraper, we fetch the specific URL. 
+        # In simulation, we just grab the first valid ad from our mock file to pretend.
+        
+        ad_block = soup.find('a', class_='photoLink')
+        if not ad_block:
+            return {"error": "Parse Error", "raw_text": "No Ads Found"}
+
+        text_content = ad_block.get_text(separator=" ", strip=True)
+        
+        # Mocking extracted fields based on the mock file content
+        # "2-STAEN, Sofia, Lozenets, 185 000 EUR"
+        extracted_data = {
+            "source_url": url,
+            "raw_text": text_content,
+            "price_predicted": 185000.0,
+            "title": "2-STAEN, Sofia, Lozenets"
+        }
+        
+        return extracted_data
+
+
+=========================================
+FILE: ./src/services/risk_engine.py
+=========================================
+from typing import Dict, Any, List
+
+class RiskEngine:
+    """
+    Translates architectural and legal discrepancies into a 0-100 Risk Score.
+    """
+    def calculate_score(self, advertised_data: Dict, ai_insights: Dict) -> Dict[str, Any]:
+        score = 0
+        flags = []
+
+        # 1. Legal Status Check (Atelier vs Apartment)
+        raw_text = advertised_data.get("raw_text", "").upper()
+        if "АТЕЛИЕ" in raw_text or "ATELIER" in raw_text:
+            score += 30
+            flags.append("LEGAL_STATUS_RISK: Property listed as Atelier (Possible industrial status)")
+
+        # 2. Floor Logic
+        if "ПОСЛЕДЕН" in raw_text or "TOP FLOOR" in raw_text:
+            score += 15
+            flags.append("MAINTENANCE_RISK: Top floor (Higher probability of roof leaks)")
+        
+        if "ПЪРВИ" in raw_text or "GROUND" in raw_text:
+            score += 10
+            flags.append("SECURITY_RISK: Ground floor/Low elevation")
+
+        # 3. High Value Verification
+        if advertised_data.get("price_predicted", 0) > 300000:
+            score += 5
+            flags.append("FINANCIAL: High-ticket verification required")
+
+        return {
+            "score": min(score, 100),
+            "flags": flags
+        }
 
 
 =========================================
@@ -155,6 +562,11 @@ FILE: ./src/main.py
 =========================================
 from fastapi import FastAPI
 from src.api import routes
+from src.db.session import engine, Base
+
+# Create Tables on Startup (The "Auto-Migration")
+# In production, we would use Alembic, but this is Guerrilla Dev.
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Glashaus API",
@@ -162,17 +574,96 @@ app = FastAPI(
     version="0.1.0"
 )
 
-# Register Router
 app.include_router(routes.router)
 
 @app.get("/")
 def health_check():
-    return {"status": "operational", "system": "GLASHAUS"}
+    return {
+        "system": "GLASHAUS", 
+        "status": "OPERATIONAL", 
+        "motto": "Transparenz ist die Währung"
+    }
 
 if __name__ == "__main__":
     import uvicorn
-    # Hot reload enabled for dev
     uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+=========================================
+FILE: ./src/db/session.py
+=========================================
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from src.core.config import settings
+
+# SQLite requires a specific argument for threading
+connect_args = {"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
+
+engine = create_engine(
+    settings.DATABASE_URL, 
+    connect_args=connect_args,
+    pool_pre_ping=True
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+=========================================
+FILE: ./src/db/models.py
+=========================================
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, ForeignKey, JSON, Text
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+from src.db.session import Base
+
+class Building(Base):
+    __tablename__ = "buildings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    cadastre_id = Column(String, unique=True, nullable=False, index=True)
+    address_street = Column(String)
+    address_number = Column(String)
+    neighborhood = Column(String)
+    # Note: GeoAlchemy2 would be needed for real Point types, using String for MVP placeholder
+    gps_coordinates = Column(String) 
+    construction_year = Column(Integer)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    reports = relationship("Report", back_populates="building")
+
+class Listing(Base):
+    __tablename__ = "listings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source_url = Column(String, unique=True, nullable=False, index=True)
+    price_bgn = Column(Float)
+    advertised_area_sqm = Column(Float)
+    description_raw = Column(Text)
+    scraped_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    reports = relationship("Report", back_populates="listing")
+
+class Report(Base):
+    __tablename__ = "reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    listing_id = Column(Integer, ForeignKey("listings.id"))
+    building_id = Column(Integer, ForeignKey("buildings.id"), nullable=True)
+    risk_score = Column(Integer)  # 0-100
+    is_address_verified = Column(Boolean, default=False)
+    discrepancy_details = Column(JSON) # Stores "Apartment vs Atelier" logic
+    cost_to_generate = Column(Float)
+
+    listing = relationship("Listing", back_populates="reports")
+    building = relationship("Building", back_populates="reports")
 
 
 =========================================
@@ -183,8 +674,12 @@ FILE: ./scripts/context_dump.sh
 output="glashaus_context.txt"
 echo "--- GLASHAUS PROJECT DUMP ---" > "$output"
 date >> "$output"
-echo "Structure:" >> "$output"
-tree -L 3 -I '.git' >> "$output" 2>/dev/null || find . -maxdepth 3 -not -path '*/.*' >> "$output"
+
+echo -e "\n\n--- GIT HISTORY ---" >> "$output"
+git log --oneline --graph --decorate -n 20 >> "$output"
+
+echo -e "\n\n--- FILE STRUCTURE ---" >> "$output"
+tree -L 3 -I '.git|__pycache__|*.pyc' >> "$output" 2>/dev/null || find . -maxdepth 3 -not -path '*/.*' >> "$output"
 
 echo -e "\n\n--- FILE CONTENTS ---" >> "$output"
 find . -type f \
@@ -192,6 +687,7 @@ find . -type f \
     -not -path './glashaus_context.txt' \
     -not -name '*.png' \
     -not -name '*.jpg' \
+    -not -name '*.sqlite' \
     | while read -r file; do
     echo -e "\n\n=========================================" >> "$output"
     echo "FILE: $file" >> "$output"
@@ -299,3 +795,123 @@ pydantic==2.6.0
 pydantic-settings==2.1.0
 google-generativeai==0.3.2
 beautifulsoup4==4.12.3
+
+
+=========================================
+FILE: ./imot_simulation.html
+=========================================
+<!DOCTYPE html>
+<html>
+<body>
+    <div class="list_ads">
+        <!-- Mock Listing 1 -->
+        <a href="//www.imot.bg/pcgi/imot.cgi?act=5&adv=1c171899111&slink=a4eg0c&f1=1" class="photoLink">
+            <div class="text_desc">
+                2-STAEN, Sofia, Lozenets, 185 000 EUR
+            </div>
+        </a>
+        
+        <!-- Mock Listing 2 -->
+        <a href="//www.imot.bg/pcgi/imot.cgi?act=5&adv=2c172200231&slink=a4eg0c&f1=1" class="photoLink">
+            <div class="text_desc">
+                3-STAEN, Sofia, Krustova Vada, 250 000 EUR, Gas/Elevator
+            </div>
+        </a>
+
+        <!-- Mock Listing 3 -->
+        <a href="//www.imot.bg/pcgi/imot.cgi?act=5&adv=3c17992881&slink=a4eg0c&f1=1" class="photoLink">
+            <div class="text_desc">
+                ATELIER, Sofia, Center, 90 000 EUR
+            </div>
+        </a>
+    </div>
+</body>
+</html>
+
+
+=========================================
+FILE: ./Dockerfile
+=========================================
+# Use Official Python Runtime
+FROM python:3.11-slim
+
+# Set Working Directory
+WORKDIR /app
+
+# Install System Dependencies (Postgres + GIS libs)
+RUN apt-get update && apt-get install -y \
+    libpq-dev gcc netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python Dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy Code
+COPY . .
+
+# Expose Port
+EXPOSE 8000
+
+# Start Command (Wait for DB, then launch)
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+=========================================
+FILE: ./docker-compose.yml
+=========================================
+version: '3.8'
+
+services:
+  # 1. The Glashaus API
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - POSTGRES_SERVER=db
+      - POSTGRES_USER=glashaus_user
+      - POSTGRES_PASSWORD=secret_password
+      - POSTGRES_DB=glashaus_db
+    depends_on:
+      - db
+    volumes:
+      - ./src:/app/src  # Hot Reload
+
+  # 2. The Database (Postgres + GIS)
+  db:
+    image: postgis/postgis:15-3.4
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=glashaus_user
+      - POSTGRES_PASSWORD=secret_password
+      - POSTGRES_DB=glashaus_db
+    ports:
+      - "5432:5432"
+
+volumes:
+  postgres_data:
+
+
+=========================================
+FILE: ./tests/test_api.py
+=========================================
+from fastapi.testclient import TestClient
+from src.main import app
+
+client = TestClient(app)
+
+def test_health_check():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.json()["status"] == "OPERATIONAL"
+
+def test_audit_flow():
+    payload = {"url": "https://www.imot.bg/pcgi/imot.cgi?act=5&adv=mock123"}
+    response = client.post("/audit", json=payload)
+    
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "QUEUED"
+    assert "listing_id" in data

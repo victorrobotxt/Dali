@@ -1,17 +1,19 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 
-from src.db.session import get_db
+from src.db.session import get_db, SessionLocal
+from src.db.models import Listing
 from src.services.repository import RealEstateRepository
-from src.services.ai_engine import GeminiService # We will hook this up later
+from src.services.scraper_service import ScraperService
+from src.services.ai_engine import GeminiService
+from src.services.risk_engine import RiskEngine
 from src.core.config import settings
 
 router = APIRouter()
 
-# DTOs (Data Transfer Objects)
 class AuditRequest(BaseModel):
-    url: str # Pydantic v2 url validation is strict, keeping string for MVP input
+    url: str
     price_override: float = 0.0
     
 class AuditResponse(BaseModel):
@@ -20,17 +22,39 @@ class AuditResponse(BaseModel):
     status: str
     note: str
 
-# Background Task (The Worker Simulation)
-async def process_audit_task(listing_id: int, db: Session):
+async def process_audit_task(listing_id: int):
     """
-    This runs AFTER the response is sent to the user.
-    It simulates the heavy lifting (Scraping + AI).
+    Background worker that runs the scrape -> AI -> Risk calculation.
+    Uses its own SessionLocal to remain thread-safe.
     """
-    print(f"WORKER: Starting AI Pipeline for Listing ID {listing_id}...")
-    # 1. Scrape (Future)
-    # 2. AI Analyze (Future)
-    # 3. Update Report in DB
-    print(f"WORKER: Finished processing listing {listing_id}.")
+    db = SessionLocal()
+    try:
+        repo = RealEstateRepository(db)
+        scraper = ScraperService(simulation_mode=True)
+        ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
+        risk_engine = RiskEngine()
+
+        listing = db.query(Listing).get(listing_id)
+        if not listing: return
+
+        # Execute Pipeline
+        scraped_data = scraper.scrape_url(listing.source_url)
+        listing.description_raw = scraped_data.get("raw_text", "Scrape failed")
+        db.commit()
+
+        ai_insights = await ai_engine.analyze_text(listing.description_raw)
+        report_data = risk_engine.calculate_score(scraped_data, ai_insights)
+
+        repo.create_report(
+            listing_id=listing.id,
+            risk=report_data["score"],
+            details={"flags": report_data["flags"], "ai_meta": ai_insights},
+            cost=0.04
+        )
+    except Exception as e:
+        print(f"CRITICAL_WORKER_ERROR: {str(e)}")
+    finally:
+        db.close()
 
 @router.post("/audit", response_model=AuditResponse)
 async def initiate_audit(
@@ -38,29 +62,20 @@ async def initiate_audit(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    """
-    1. Receives URL.
-    2. Writes to DB (Idempotent).
-    3. Spawns Background Worker.
-    4. Returns 200 OK immediately.
-    """
     repo = RealEstateRepository(db)
     
-    # Create the Listing Record (The "Files" are opened)
     listing = repo.create_listing(
         url=str(request.url),
         price=request.price_override, 
-        area=0.0, # Placeholder
-        desc="Pending Scrape"
+        area=0.0, 
+        desc="Pending Processing"
     )
     
-    # Offload the heavy work to background task
-    # We pass the db session to the background worker (Warning: Thread scope issues in prod, ok for MVP)
-    background_tasks.add_task(process_audit_task, listing.id, db)
+    background_tasks.add_task(process_audit_task, listing.id)
     
     return {
         "listing_id": listing.id,
         "source_url": listing.source_url,
         "status": "QUEUED",
-        "note": "The Siege Tower is processing your request."
+        "note": "The Siege Tower is advancing."
     }
