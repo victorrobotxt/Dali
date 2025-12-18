@@ -1,0 +1,35 @@
+openapi: 3.0.0
+info:
+  title: Glashaus API
+  version: 0.1.0
+paths:
+  /audit/url:
+    post:
+      summary: Initiate an Audit for a specific Listing URL
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+                  format: uri
+      responses:
+        '200':
+          description: Audit Complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  report_id:
+                    type: integer
+                  risk_score:
+                    type: integer
+                  verified_address:
+                    type: string
+                  ai_reasoning:
+                    type: array
+                    items:
+                      type: string
