@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  # 1. The Glashaus API
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - POSTGRES_SERVER=db
+      - POSTGRES_USER=glashaus_user
+      - POSTGRES_PASSWORD=secret_password
+      - POSTGRES_DB=glashaus_db
+    depends_on:
+      - db
+    volumes:
+      - ./src:/app/src  # Hot Reload
+
+  # 2. The Database (Postgres + GIS)
+  db:
+    image: postgis/postgis:15-3.4
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=glashaus_user
+      - POSTGRES_PASSWORD=secret_password
+      - POSTGRES_DB=glashaus_db
+    ports:
+      - "5432:5432"
+
+volumes:
+  postgres_data:
