@@ -10,6 +10,9 @@ class Settings:
     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "")
     POSTGRES_DB: str = os.getenv("POSTGRES_DB", "glashaus")
     POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "postgres")
+
+    # NEW: Redis Configuration for Celery
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
     
     @property
     def DATABASE_URL(self) -> str:

@@ -11,12 +11,36 @@ services:
       - POSTGRES_USER=glashaus_user
       - POSTGRES_PASSWORD=secret_password
       - POSTGRES_DB=glashaus_db
+      - REDIS_URL=redis://redis:6379/0
     depends_on:
       - db
+      - redis
     volumes:
-      - ./src:/app/src  # Hot Reload
+      - ./src:/app/src
 
-  # 2. The Database (Postgres + GIS)
+  # 2. The Worker (Celery)
+  worker:
+    build: .
+    command: celery -A src.worker.celery_app worker --loglevel=info
+    environment:
+      - POSTGRES_SERVER=db
+      - POSTGRES_USER=glashaus_user
+      - POSTGRES_PASSWORD=secret_password
+      - POSTGRES_DB=glashaus_db
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./src:/app/src
+
+  # 3. Redis (Queue Broker)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  # 4. The Database
   db:
     image: postgis/postgis:15-3.4
     volumes:

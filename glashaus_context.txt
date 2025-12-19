@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Thu Dec 18 16:41:31 EET 2025
+Fri Dec 19 08:21:26 EET 2025
 
 
 --- GIT HISTORY ---
-* e847d18 (HEAD -> main) feat(backend): complete ORM models, repo pattern, and test suite
+* f22a7da (HEAD -> main) feat(core): implement AI engine, workflow logic, and docs
+* e847d18 feat(backend): complete ORM models, repo pattern, and test suite
 * d266a4d ops: add docker containerization and orchestration
 * 07beab5 feat(scraper): implement simulation mode to bypass WAF during dev
 * 8d13095 chore(scripts): include git log in context dumper
@@ -26,6 +27,7 @@ Thu Dec 18 16:41:31 EET 2025
 ./src/api/routes.py
 ./src/core
 ./src/core/config.py
+./src/core/utils.py
 ./src/services
 ./src/services/ai_engine.py
 ./src/services/repository.py
@@ -44,6 +46,7 @@ Thu Dec 18 16:41:31 EET 2025
 ./prompts/detective_prompt_v1.md
 ./db
 ./db/schema_v1.sql
+./db/migration_001_status_workflow.sql
 ./README.md
 ./glashaus_context.txt
 ./requirements.txt
@@ -203,34 +206,22 @@ FILE: ./docs/TECHNICAL_DEBT.md
 FILE: ./src/api/routes.py
 =========================================
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-
 from src.db.session import get_db, SessionLocal
-from src.db.models import Listing
+from src.db.models import Listing, ReportStatus
 from src.services.repository import RealEstateRepository
 from src.services.scraper_service import ScraperService
 from src.services.ai_engine import GeminiService
 from src.services.risk_engine import RiskEngine
 from src.core.config import settings
+from pydantic import BaseModel
 
 router = APIRouter()
 
 class AuditRequest(BaseModel):
     url: str
     price_override: float = 0.0
-    
-class AuditResponse(BaseModel):
-    listing_id: int
-    source_url: str
-    status: str
-    note: str
 
 async def process_audit_task(listing_id: int):
-    """
-    Background worker that runs the scrape -> AI -> Risk calculation.
-    Uses its own SessionLocal to remain thread-safe.
-    """
     db = SessionLocal()
     try:
         repo = RealEstateRepository(db)
@@ -241,48 +232,52 @@ async def process_audit_task(listing_id: int):
         listing = db.query(Listing).get(listing_id)
         if not listing: return
 
-        # Execute Pipeline
+        # 1. SCRAPE
         scraped_data = scraper.scrape_url(listing.source_url)
-        listing.description_raw = scraped_data.get("raw_text", "Scrape failed")
+        listing.description_raw = scraped_data["raw_text"]
         db.commit()
 
-        ai_insights = await ai_engine.analyze_text(listing.description_raw)
-        report_data = risk_engine.calculate_score(scraped_data, ai_insights)
+        # 2. TIER 1: TEXT ANALYSIS (Cheap)
+        print(f"PIPELINE: Running Tier 1 (Text) for {listing_id}...")
+        tier1_result = await ai_engine.analyze_text(scraped_data["raw_text"])
+        confidence = tier1_result.get("confidence", 0)
+        
+        final_ai_data = tier1_result
+        total_cost = 0.04
 
+        # 3. TIER 2: VISION ESCALATION (Expensive)
+        # If Tier 1 is unsure (< 80%), we spend $0.22 to look at photos
+        if confidence < 80 and settings.GEMINI_API_KEY != "mock-key":
+            print(f"PIPELINE: Escalating to Tier 2 (Vision) - Confidence: {confidence}%")
+            tier2_result = await ai_engine.analyze_images(scraped_data["image_urls"])
+            final_ai_data["vision_insights"] = tier2_result
+            total_cost += 0.22
+            # Boost confidence if Vision confirms building
+            confidence = max(confidence, tier2_result.get("confidence", 0))
+
+        # 4. RISK CALCULATION
+        report_data = risk_engine.calculate_score(scraped_data, final_ai_data)
+
+        # 5. GENERATE FINAL REPORT
         repo.create_report(
             listing_id=listing.id,
             risk=report_data["score"],
-            details={"flags": report_data["flags"], "ai_meta": ai_insights},
-            cost=0.04
+            details={"flags": report_data["flags"], "ai_meta": final_ai_data},
+            cost=total_cost,
+            confidence=confidence
         )
+
     except Exception as e:
-        print(f"CRITICAL_WORKER_ERROR: {str(e)}")
+        print(f"PIPELINE_ERROR: {str(e)}")
     finally:
         db.close()
 
-@router.post("/audit", response_model=AuditResponse)
-async def initiate_audit(
-    request: AuditRequest, 
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db)
-):
+@router.post("/audit")
+async def initiate_audit(request: AuditRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     repo = RealEstateRepository(db)
-    
-    listing = repo.create_listing(
-        url=str(request.url),
-        price=request.price_override, 
-        area=0.0, 
-        desc="Pending Processing"
-    )
-    
+    listing = repo.create_listing(url=request.url, price=request.price_override, area=0.0, desc="Queued")
     background_tasks.add_task(process_audit_task, listing.id)
-    
-    return {
-        "listing_id": listing.id,
-        "source_url": listing.source_url,
-        "status": "QUEUED",
-        "note": "The Siege Tower is advancing."
-    }
+    return {"listing_id": listing.id, "status": "QUEUED"}
 
 
 =========================================
@@ -314,45 +309,113 @@ if settings.GEMINI_API_KEY == "mock-key":
 
 
 =========================================
+FILE: ./src/core/utils.py
+=========================================
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
+def normalize_url(url: str) -> str:
+    """
+    Strips tracking parameters and fragments from real estate URLs.
+    Example: ...imot.cgi?act=5&adv=123&utm_medium=fb -> ...imot.cgi?act=5&adv=123
+    """
+    u = urlparse(url)
+    query = dict(parse_qsl(u.query))
+    
+    # Keep only essential keys for imot.bg and similar
+    # act=5 is common for search results, adv=ID is the unique ad identifier
+    whitelist = {'act', 'adv', 'id', 'slink'}
+    clean_query = {k: v for k, v in query.items() if k.lower() in whitelist}
+    
+    # Reconstruct
+    return urlunparse((
+        u.scheme,
+        u.netloc,
+        u.path,
+        u.params,
+        urlencode(clean_query),
+        '' # Strip fragments (#)
+    ))
+
+
+=========================================
 FILE: ./src/services/ai_engine.py
 =========================================
-from abc import ABC, abstractmethod
-from typing import Dict, Any
 import google.generativeai as genai
+import json
+import os
+from typing import Dict, Any, List
 from src.core.config import settings
 
-class AIEngineInterface(ABC):
-    @abstractmethod
-    async def analyze_text(self, text: str) -> Dict[str, Any]:
-        pass
-
-    @abstractmethod
-    async def analyze_images(self, image_urls: list[str]) -> Dict[str, Any]:
-        pass
+class AIEngineInterface:
+    async def analyze_listing(self, text: str, images: List[str] = None) -> Dict[str, Any]:
+        raise NotImplementedError
 
 class GeminiService(AIEngineInterface):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        if api_key != "mock-key":
+        self.prompt_path = "prompts/detective_prompt_v1.md"
+        
+        # Configure Gemini if Key is real
+        if self.api_key != "mock-key":
             genai.configure(api_key=self.api_key)
+            # Tier 1: Fast & Cheap (Text Only) - approx /data/data/com.termux/files/usr/bin/bash.04/M tokens
             self.model_flash = genai.GenerativeModel('gemini-1.5-flash')
-            self.model_pro = genai.GenerativeModel('gemini-1.5-pro')
+            # Tier 2: Expensive (Multimodal / Vision) - approx /data/data/com.termux/files/usr/bin/bash.22/M tokens
+            self.model_pro = genai.GenerativeModel('gemini-1.5-pro-vision')
         else:
             self.model_flash = None
             self.model_pro = None
-    
+
+    def _load_prompt(self, raw_text: str) -> str:
+        """Loads the system prompt and injects the raw listing text."""
+        # Fallback for Docker/Path issues
+        if not os.path.exists(self.prompt_path):
+            return f"Analyze this real estate listing and return JSON: {raw_text}"
+            
+        with open(self.prompt_path, "r") as f:
+            template = f.read()
+            
+        # Inject the raw text into the {text_raw} slot defined in prompts/detective_prompt_v1.md
+        # Defaulting neighborhood to 'Unknown' if not provided by scraper yet
+        return template.replace("{text_raw}", raw_text).replace("{neighborhood}", "Unknown")
+
     async def analyze_text(self, text: str) -> Dict[str, Any]:
+        """
+        Orchestrates the Tier 1 Analysis.
+        Maps to 'Analysis Tier 1 (Cheap)' in ARCHITECTURE.md.
+        """
         if not self.model_flash:
-            return {"address_found": False, "confidence": 0.0, "entities": {}}
-        
-        prompt = f"Analyze listing text for: Street, Neighborhood, Floor, and Net Area. Text: {text}"
+            # Simulation Response for Dev Mode
+            return {
+                "address_prediction": "Simulated Address", 
+                "confidence": 0.0, 
+                "reasoning": "Mock Mode Active"
+            }
+
         try:
-            response = self.model_flash.generate_content(prompt)
-            return {"raw_ai_output": response.text, "confidence": 0.9}
+            prompt = self._load_prompt(text)
+            
+            # Force JSON mode for structured data extraction
+            response = self.model_flash.generate_content(
+                prompt,
+                generation_config={"response_mime_type": "application/json"}
+            )
+            
+            # Parse the JSON output
+            result = json.loads(response.text)
+            
+            # Ensure confidence is an integer for the Logic Gate
+            if "confidence" not in result:
+                result["confidence"] = 0
+                
+            return result
+
         except Exception as e:
+            print(f"[AI ENGINE] Error: {e}")
             return {"error": str(e), "confidence": 0.0}
 
     async def analyze_images(self, image_urls: list[str]) -> Dict[str, Any]:
+        # Placeholder for Tier 2 Logic
         return {"building_id": "UNKNOWN", "risk_factors": ["Vision implementation pending"]}
 
 
@@ -360,7 +423,8 @@ class GeminiService(AIEngineInterface):
 FILE: ./src/services/repository.py
 =========================================
 from sqlalchemy.orm import Session
-from src.db.models import Listing, Report
+from src.db.models import Listing, Report, ReportStatus
+from src.core.utils import normalize_url
 from typing import Optional
 
 class RealEstateRepository:
@@ -368,15 +432,13 @@ class RealEstateRepository:
         self.db = db
 
     def create_listing(self, url: str, price: float, area: float, desc: str) -> Listing:
-        """
-        Idempotent creation: If URL exists, return existing.
-        """
-        existing = self.get_listing_by_url(url)
+        clean_url = normalize_url(url)
+        existing = self.get_listing_by_url(clean_url)
         if existing:
             return existing
             
         new_listing = Listing(
-            source_url=url,
+            source_url=clean_url,
             price_bgn=price,
             advertised_area_sqm=area,
             description_raw=desc
@@ -389,10 +451,19 @@ class RealEstateRepository:
     def get_listing_by_url(self, url: str) -> Optional[Listing]:
         return self.db.query(Listing).filter(Listing.source_url == url).first()
 
-    def create_report(self, listing_id: int, risk: int, details: dict, cost: float) -> Report:
+    def create_report(self, listing_id: int, risk: int, details: dict, cost: float, confidence: int = 0) -> Report:
+        """
+        Decision Logic:
+        If AI Confidence < 70, the status is MANUAL_REVIEW regardless of risk.
+        If Risk > 80, it's flagged as VERIFIED (but high risk).
+        """
+        status = ReportStatus.VERIFIED if confidence >= 70 else ReportStatus.MANUAL_REVIEW
+        
         report = Report(
             listing_id=listing_id,
             risk_score=risk,
+            ai_confidence_score=confidence,
+            status=status,
             discrepancy_details=details,
             cost_to_generate=cost
         )
@@ -473,44 +544,36 @@ class ScraperService:
         self.mock_file = "imot_simulation.html"
 
     def scrape_url(self, url: str) -> dict:
-        """
-        Simulates extracting data from a specific URL.
-        Returns a Dictionary of listing data.
-        """
         print(f"[SCRAPER] Target: {url}")
         
-        # 1. Load HTML (Mock or Real)
         html_content = ""
         if self.simulation:
             if not os.path.exists(self.mock_file):
-                # Fallback if file missing
                 return {"error": "Mock file missing"}
             with open(self.mock_file, "r", encoding="utf-8") as f:
                 html_content = f.read()
         
-        # 2. Parse
         soup = BeautifulSoup(html_content, 'html.parser')
         
-        # 3. Simulate finding the SPECIFIC ad requested
-        # In a real scraper, we fetch the specific URL. 
-        # In simulation, we just grab the first valid ad from our mock file to pretend.
-        
-        ad_block = soup.find('a', class_='photoLink')
-        if not ad_block:
-            return {"error": "Parse Error", "raw_text": "No Ads Found"}
+        # Extract main text
+        ad_block = soup.find('div', class_='text_desc') # Updated to match your mock HTML
+        raw_text = ad_block.get_text(strip=True) if ad_block else "No text found"
 
-        text_content = ad_block.get_text(separator=" ", strip=True)
+        # NEW: Extract Image URLs (Simulated)
+        # In a real imot.bg scrape, you'd look for <img class="gallery">
+        images = [
+            "https://imot.bg/images/main_facade_1.jpg",
+            "https://imot.bg/images/living_room_2.jpg",
+            "https://imot.bg/images/window_view_3.jpg"
+        ]
         
-        # Mocking extracted fields based on the mock file content
-        # "2-STAEN, Sofia, Lozenets, 185 000 EUR"
-        extracted_data = {
+        return {
             "source_url": url,
-            "raw_text": text_content,
+            "raw_text": raw_text,
+            "image_urls": images,
             "price_predicted": 185000.0,
-            "title": "2-STAEN, Sofia, Lozenets"
+            "area": 85.0
         }
-        
-        return extracted_data
 
 
 =========================================
@@ -619,10 +682,18 @@ def get_db():
 =========================================
 FILE: ./src/db/models.py
 =========================================
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, ForeignKey, JSON, Text
+import enum
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, ForeignKey, JSON, Text, Enum
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from src.db.session import Base
+
+class ReportStatus(set, enum.Enum):
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    VERIFIED = "VERIFIED"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
+    REJECTED = "REJECTED"
 
 class Building(Base):
     __tablename__ = "buildings"
@@ -632,7 +703,6 @@ class Building(Base):
     address_street = Column(String)
     address_number = Column(String)
     neighborhood = Column(String)
-    # Note: GeoAlchemy2 would be needed for real Point types, using String for MVP placeholder
     gps_coordinates = Column(String) 
     construction_year = Column(Integer)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -644,6 +714,7 @@ class Listing(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     source_url = Column(String, unique=True, nullable=False, index=True)
+    content_hash = Column(String(64), index=True) # For idempotency
     price_bgn = Column(Float)
     advertised_area_sqm = Column(Float)
     description_raw = Column(Text)
@@ -657,10 +728,16 @@ class Report(Base):
     id = Column(Integer, primary_key=True, index=True)
     listing_id = Column(Integer, ForeignKey("listings.id"))
     building_id = Column(Integer, ForeignKey("buildings.id"), nullable=True)
+    
+    status = Column(Enum(ReportStatus), default=ReportStatus.PENDING)
     risk_score = Column(Integer)  # 0-100
+    ai_confidence_score = Column(Integer, default=0)
+    
     is_address_verified = Column(Boolean, default=False)
-    discrepancy_details = Column(JSON) # Stores "Apartment vs Atelier" logic
+    discrepancy_details = Column(JSON)
+    manual_review_notes = Column(Text)
     cost_to_generate = Column(Float)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     listing = relationship("Listing", back_populates="reports")
     building = relationship("Building", back_populates="reports")
@@ -762,6 +839,45 @@ CREATE TABLE reports (
     discrepancy_details JSONB, -- Stores the "Apartment vs Atelier" logic
     cost_to_generate DECIMAL(10, 4) -- Tracking the $0.22 API cost
 );
+
+
+=========================================
+FILE: ./db/migration_001_status_workflow.sql
+=========================================
+-- 1. Create the Workflow Status Enum
+-- This supports the PENDING -> VERIFIED -> MANUAL_REVIEW flow
+DO $$ BEGIN
+    CREATE TYPE report_status AS ENUM ('PENDING', 'PROCESSING', 'VERIFIED', 'MANUAL_REVIEW', 'REJECTED');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+-- 2. Update 'reports' table
+ALTER TABLE reports 
+ADD COLUMN IF NOT EXISTS status report_status DEFAULT 'PENDING',
+ADD COLUMN IF NOT EXISTS ai_confidence_score INT DEFAULT 0,
+ADD COLUMN IF NOT EXISTS manual_review_notes TEXT;
+
+-- 3. Update 'listings' table for Idempotency
+-- We hash the file/content to prevent duplicate processing of the same upload
+ALTER TABLE listings
+ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64);
+
+CREATE INDEX IF NOT EXISTS idx_listings_content_hash ON listings(content_hash);
+
+-- 4. Create the Manual Review Queue View
+-- This allows the Admin Panel to easily select tasks needing human eyes
+CREATE OR REPLACE VIEW view_manual_review_queue AS
+SELECT 
+    r.id as report_id,
+    l.source_url,
+    r.ai_confidence_score,
+    r.risk_score,
+    r.created_at
+FROM reports r
+JOIN listings l ON r.listing_id = l.id
+WHERE r.status = 'MANUAL_REVIEW'
+ORDER BY r.risk_score DESC;
 
 
 =========================================

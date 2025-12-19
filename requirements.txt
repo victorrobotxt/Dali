@@ -7,3 +7,6 @@ pydantic==2.6.0
 pydantic-settings==2.1.0
 google-generativeai==0.3.2
 beautifulsoup4==4.12.3
+celery==5.3.6
+redis==5.0.1
+alembic==1.13.1

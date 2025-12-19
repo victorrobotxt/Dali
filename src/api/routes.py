@@ -1,81 +1,80 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
-
-from src.db.session import get_db, SessionLocal
-from src.db.models import Listing
+from src.db.session import get_db
+from src.db.models import Listing, Report, ReportStatus
 from src.services.repository import RealEstateRepository
-from src.services.scraper_service import ScraperService
-from src.services.ai_engine import GeminiService
-from src.services.risk_engine import RiskEngine
-from src.core.config import settings
+from src.tasks import audit_listing_task
+from pydantic import BaseModel
+from typing import Optional
 
 router = APIRouter()
 
 class AuditRequest(BaseModel):
     url: str
     price_override: float = 0.0
-    
-class AuditResponse(BaseModel):
-    listing_id: int
-    source_url: str
+
+class ReportUpdate(BaseModel):
     status: str
-    note: str
+    manual_notes: Optional[str] = None
 
-async def process_audit_task(listing_id: int):
+@router.post("/audit")
+async def initiate_audit(request: AuditRequest, db: Session = Depends(get_db)):
     """
-    Background worker that runs the scrape -> AI -> Risk calculation.
-    Uses its own SessionLocal to remain thread-safe.
+    Submits a URL for auditing via the Celery Worker queue.
     """
-    db = SessionLocal()
-    try:
-        repo = RealEstateRepository(db)
-        scraper = ScraperService(simulation_mode=True)
-        ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
-        risk_engine = RiskEngine()
-
-        listing = db.query(Listing).get(listing_id)
-        if not listing: return
-
-        # Execute Pipeline
-        scraped_data = scraper.scrape_url(listing.source_url)
-        listing.description_raw = scraped_data.get("raw_text", "Scrape failed")
-        db.commit()
-
-        ai_insights = await ai_engine.analyze_text(listing.description_raw)
-        report_data = risk_engine.calculate_score(scraped_data, ai_insights)
-
-        repo.create_report(
-            listing_id=listing.id,
-            risk=report_data["score"],
-            details={"flags": report_data["flags"], "ai_meta": ai_insights},
-            cost=0.04
-        )
-    except Exception as e:
-        print(f"CRITICAL_WORKER_ERROR: {str(e)}")
-    finally:
-        db.close()
-
-@router.post("/audit", response_model=AuditResponse)
-async def initiate_audit(
-    request: AuditRequest, 
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db)
-):
     repo = RealEstateRepository(db)
+    # Create listing immediately to return ID
+    listing = repo.create_listing(url=request.url, price=request.price_override, area=0.0, desc="Queued")
     
-    listing = repo.create_listing(
-        url=str(request.url),
-        price=request.price_override, 
-        area=0.0, 
-        desc="Pending Processing"
-    )
+    # Offload to Redis/Celery
+    audit_listing_task.delay(listing.id)
     
-    background_tasks.add_task(process_audit_task, listing.id)
-    
+    return {"listing_id": listing.id, "status": "QUEUED_IN_REDIS"}
+
+@router.get("/reports/{listing_id}")
+def get_report(listing_id: int, db: Session = Depends(get_db)):
+    """
+    Retrieves the report status and details for a listing.
+    """
+    listing = db.query(Listing).filter(Listing.id == listing_id).first()
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+        
+    report = db.query(Report).filter(Report.listing_id == listing_id).first()
+    if not report:
+        # If no report exists yet, the worker is likely still processing
+        return {"status": "PROCESSING", "details": "Audit is currently in the queue."}
+        
     return {
-        "listing_id": listing.id,
-        "source_url": listing.source_url,
-        "status": "QUEUED",
-        "note": "The Siege Tower is advancing."
+        "report_id": report.id,
+        "status": report.status,
+        "risk_score": report.risk_score,
+        "ai_confidence": report.ai_confidence_score,
+        "discrepancies": report.discrepancy_details,
+        "manual_notes": report.manual_review_notes,
+        "cost": report.cost_to_generate,
+        "created_at": report.created_at
     }
+
+@router.patch("/reports/{report_id}")
+def update_report_status(report_id: int, update: ReportUpdate, db: Session = Depends(get_db)):
+    """
+    Manual Review Action.
+    Updates status (e.g., MANUAL_REVIEW -> VERIFIED).
+    """
+    report = db.query(Report).filter(Report.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+        
+    try:
+        # Validate that the string provided matches the Enum
+        new_status = ReportStatus(update.status)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Status Enum")
+
+    report.status = new_status
+    if update.manual_notes:
+        report.manual_review_notes = update.manual_notes
+        
+    db.commit()
+    return {"id": report.id, "new_status": report.status}

@@ -1,10 +1,8 @@
 from fastapi import FastAPI
 from src.api import routes
-from src.db.session import engine, Base
 
-# Create Tables on Startup (The "Auto-Migration")
-# In production, we would use Alembic, but this is Guerrilla Dev.
-Base.metadata.create_all(bind=engine)
+# Note: Base.metadata.create_all removed. 
+# We now strictly use Alembic for schema management.
 
 app = FastAPI(
     title="Glashaus API",
