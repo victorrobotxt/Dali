@@ -10,3 +10,4 @@ beautifulsoup4==4.12.3
 celery==5.3.6
 redis==5.0.1
 alembic==1.13.1
+Pillow==10.2.0

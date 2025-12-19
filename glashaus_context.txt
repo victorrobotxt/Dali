@@ -1,9 +1,12 @@
 --- GLASHAUS PROJECT DUMP ---
-Fri Dec 19 08:21:26 EET 2025
+Fri Dec 19 08:37:58 EET 2025
 
 
 --- GIT HISTORY ---
-* f22a7da (HEAD -> main) feat(core): implement AI engine, workflow logic, and docs
+* 4987d66 (HEAD -> main) feat(infra): add Nginx gateway, CORS, and live scraping logic
+* ae76a80 refactor(core): upgrade architecture to Celery/Redis and harden AI logic
+* b7f3797 refactor(core): migrate to Redis/Celery queue and add Alembic migrations
+* f22a7da feat(core): implement AI engine, workflow logic, and docs
 * e847d18 feat(backend): complete ORM models, repo pattern, and test suite
 * d266a4d ops: add docker containerization and orchestration
 * 07beab5 feat(scraper): implement simulation mode to bypass WAF during dev
@@ -34,12 +37,15 @@ Fri Dec 19 08:21:26 EET 2025
 ./src/services/scraper_mvp.py
 ./src/services/scraper_service.py
 ./src/services/risk_engine.py
+./src/services/cadastre_service.py
 ./src/models
 ./src/__init__.py
 ./src/main.py
 ./src/db
 ./src/db/session.py
 ./src/db/models.py
+./src/worker.py
+./src/tasks.py
 ./scripts
 ./scripts/context_dump.sh
 ./prompts
@@ -47,6 +53,8 @@ Fri Dec 19 08:21:26 EET 2025
 ./db
 ./db/schema_v1.sql
 ./db/migration_001_status_workflow.sql
+./db/migrations
+./db/migrations/env.py
 ./README.md
 ./glashaus_context.txt
 ./requirements.txt
@@ -55,6 +63,9 @@ Fri Dec 19 08:21:26 EET 2025
 ./docker-compose.yml
 ./tests
 ./tests/test_api.py
+./alembic.ini
+./nginx
+./nginx/nginx.conf
 
 
 --- FILE CONTENTS ---
@@ -205,15 +216,14 @@ FILE: ./docs/TECHNICAL_DEBT.md
 =========================================
 FILE: ./src/api/routes.py
 =========================================
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from src.db.session import get_db, SessionLocal
-from src.db.models import Listing, ReportStatus
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from src.db.session import get_db
+from src.db.models import Listing, Report, ReportStatus
 from src.services.repository import RealEstateRepository
-from src.services.scraper_service import ScraperService
-from src.services.ai_engine import GeminiService
-from src.services.risk_engine import RiskEngine
-from src.core.config import settings
+from src.tasks import audit_listing_task
 from pydantic import BaseModel
+from typing import Optional
 
 router = APIRouter()
 
@@ -221,63 +231,71 @@ class AuditRequest(BaseModel):
     url: str
     price_override: float = 0.0
 
-async def process_audit_task(listing_id: int):
-    db = SessionLocal()
-    try:
-        repo = RealEstateRepository(db)
-        scraper = ScraperService(simulation_mode=True)
-        ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
-        risk_engine = RiskEngine()
-
-        listing = db.query(Listing).get(listing_id)
-        if not listing: return
-
-        # 1. SCRAPE
-        scraped_data = scraper.scrape_url(listing.source_url)
-        listing.description_raw = scraped_data["raw_text"]
-        db.commit()
-
-        # 2. TIER 1: TEXT ANALYSIS (Cheap)
-        print(f"PIPELINE: Running Tier 1 (Text) for {listing_id}...")
-        tier1_result = await ai_engine.analyze_text(scraped_data["raw_text"])
-        confidence = tier1_result.get("confidence", 0)
-        
-        final_ai_data = tier1_result
-        total_cost = 0.04
-
-        # 3. TIER 2: VISION ESCALATION (Expensive)
-        # If Tier 1 is unsure (< 80%), we spend $0.22 to look at photos
-        if confidence < 80 and settings.GEMINI_API_KEY != "mock-key":
-            print(f"PIPELINE: Escalating to Tier 2 (Vision) - Confidence: {confidence}%")
-            tier2_result = await ai_engine.analyze_images(scraped_data["image_urls"])
-            final_ai_data["vision_insights"] = tier2_result
-            total_cost += 0.22
-            # Boost confidence if Vision confirms building
-            confidence = max(confidence, tier2_result.get("confidence", 0))
-
-        # 4. RISK CALCULATION
-        report_data = risk_engine.calculate_score(scraped_data, final_ai_data)
-
-        # 5. GENERATE FINAL REPORT
-        repo.create_report(
-            listing_id=listing.id,
-            risk=report_data["score"],
-            details={"flags": report_data["flags"], "ai_meta": final_ai_data},
-            cost=total_cost,
-            confidence=confidence
-        )
-
-    except Exception as e:
-        print(f"PIPELINE_ERROR: {str(e)}")
-    finally:
-        db.close()
+class ReportUpdate(BaseModel):
+    status: str
+    manual_notes: Optional[str] = None
 
 @router.post("/audit")
-async def initiate_audit(request: AuditRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+async def initiate_audit(request: AuditRequest, db: Session = Depends(get_db)):
+    """
+    Submits a URL for auditing via the Celery Worker queue.
+    """
     repo = RealEstateRepository(db)
+    # Create listing immediately to return ID
     listing = repo.create_listing(url=request.url, price=request.price_override, area=0.0, desc="Queued")
-    background_tasks.add_task(process_audit_task, listing.id)
-    return {"listing_id": listing.id, "status": "QUEUED"}
+    
+    # Offload to Redis/Celery
+    audit_listing_task.delay(listing.id)
+    
+    return {"listing_id": listing.id, "status": "QUEUED_IN_REDIS"}
+
+@router.get("/reports/{listing_id}")
+def get_report(listing_id: int, db: Session = Depends(get_db)):
+    """
+    Retrieves the report status and details for a listing.
+    """
+    listing = db.query(Listing).filter(Listing.id == listing_id).first()
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+        
+    report = db.query(Report).filter(Report.listing_id == listing_id).first()
+    if not report:
+        # If no report exists yet, the worker is likely still processing
+        return {"status": "PROCESSING", "details": "Audit is currently in the queue."}
+        
+    return {
+        "report_id": report.id,
+        "status": report.status,
+        "risk_score": report.risk_score,
+        "ai_confidence": report.ai_confidence_score,
+        "discrepancies": report.discrepancy_details,
+        "manual_notes": report.manual_review_notes,
+        "cost": report.cost_to_generate,
+        "created_at": report.created_at
+    }
+
+@router.patch("/reports/{report_id}")
+def update_report_status(report_id: int, update: ReportUpdate, db: Session = Depends(get_db)):
+    """
+    Manual Review Action.
+    Updates status (e.g., MANUAL_REVIEW -> VERIFIED).
+    """
+    report = db.query(Report).filter(Report.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+        
+    try:
+        # Validate that the string provided matches the Enum
+        new_status = ReportStatus(update.status)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Status Enum")
+
+    report.status = new_status
+    if update.manual_notes:
+        report.manual_review_notes = update.manual_notes
+        
+    db.commit()
+    return {"id": report.id, "new_status": report.status}
 
 
 =========================================
@@ -295,6 +313,9 @@ class Settings:
     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "")
     POSTGRES_DB: str = os.getenv("POSTGRES_DB", "glashaus")
     POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "postgres")
+
+    # NEW: Redis Configuration for Celery
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
     
     @property
     def DATABASE_URL(self) -> str:
@@ -312,29 +333,61 @@ if settings.GEMINI_API_KEY == "mock-key":
 FILE: ./src/core/utils.py
 =========================================
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+import hashlib
+import re
 
 def normalize_url(url: str) -> str:
     """
-    Strips tracking parameters and fragments from real estate URLs.
-    Example: ...imot.cgi?act=5&adv=123&utm_medium=fb -> ...imot.cgi?act=5&adv=123
+    Strips tracking parameters and fragments.
     """
     u = urlparse(url)
     query = dict(parse_qsl(u.query))
-    
-    # Keep only essential keys for imot.bg and similar
-    # act=5 is common for search results, adv=ID is the unique ad identifier
     whitelist = {'act', 'adv', 'id', 'slink'}
     clean_query = {k: v for k, v in query.items() if k.lower() in whitelist}
-    
-    # Reconstruct
     return urlunparse((
-        u.scheme,
-        u.netloc,
-        u.path,
-        u.params,
-        urlencode(clean_query),
-        '' # Strip fragments (#)
+        u.scheme, u.netloc, u.path, u.params,
+        urlencode(clean_query), ''
     ))
+
+def calculate_content_hash(text: str, price: float) -> str:
+    """
+    Generates a SHA256 hash of the description + price.
+    Used for Idempotency to detect if a bumped listing is actually identical.
+    """
+    # Normalize text to ignore whitespace diffs
+    clean_text = re.sub(r'\s+', ' ', text).strip().lower()
+    raw = f"{clean_text}{price}".encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()
+
+def normalize_address(raw_address: str) -> str:
+    """
+    Standardizes Bulgarian addresses for cross-referencing.
+    Input: "ul. 'Pirotska' No 5, et. 2" -> "PIROTSKA 5"
+    """
+    if not raw_address:
+        return "UNKNOWN"
+        
+    # 1. Transliterate/Cleanup (Simplified for this example)
+    clean = raw_address.lower()
+    
+    # 2. Remove common prefixes
+    prefixes = [r"ul\.", r"ulitsa", r"str\.", r"street", r"bulevard", r"bul\.", r"bl\.", r"block"]
+    for p in prefixes:
+        clean = re.sub(p, "", clean)
+        
+    # 3. Remove punctuation
+    clean = re.sub(r"[,'\"\.]", " ", clean)
+    
+    # 4. Extract Street Name and Number
+    # Looking for: (Text) ... (Number)
+    # This is a heuristic; production needs a better geocoder
+    match = re.search(r"([a-z\s]+)\s+(\d+)", clean)
+    if match:
+        street = match.group(1).strip().upper()
+        number = match.group(2)
+        return f"{street} {number}"
+        
+    return clean.strip().upper()
 
 
 =========================================
@@ -343,80 +396,81 @@ FILE: ./src/services/ai_engine.py
 import google.generativeai as genai
 import json
 import os
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from src.core.config import settings
+from pydantic import BaseModel, Field
 
-class AIEngineInterface:
-    async def analyze_listing(self, text: str, images: List[str] = None) -> Dict[str, Any]:
-        raise NotImplementedError
+# --- PYDANTIC SCHEMA FOR GUARDRAILS ---
+class AIAnalysisSchema(BaseModel):
+    """
+    Enforces structure on the LLM output.
+    Ref: Google GenAI SDK Docs
+    """
+    address_prediction: str = Field(description="The deduced street address")
+    confidence: int = Field(ge=0, le=100, description="Confidence score 0-100")
+    reasoning_steps: List[str] = Field(description="Bullet points explaining the deduction")
+    neighborhood: str = Field(description="Inferred neighborhood")
+    is_atelier: bool = Field(description="True if property is legally an Atelier/Studio")
 
-class GeminiService(AIEngineInterface):
+class GeminiService:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.prompt_path = "prompts/detective_prompt_v1.md"
         
-        # Configure Gemini if Key is real
         if self.api_key != "mock-key":
             genai.configure(api_key=self.api_key)
-            # Tier 1: Fast & Cheap (Text Only) - approx /data/data/com.termux/files/usr/bin/bash.04/M tokens
             self.model_flash = genai.GenerativeModel('gemini-1.5-flash')
-            # Tier 2: Expensive (Multimodal / Vision) - approx /data/data/com.termux/files/usr/bin/bash.22/M tokens
             self.model_pro = genai.GenerativeModel('gemini-1.5-pro-vision')
         else:
             self.model_flash = None
             self.model_pro = None
 
     def _load_prompt(self, raw_text: str) -> str:
-        """Loads the system prompt and injects the raw listing text."""
-        # Fallback for Docker/Path issues
-        if not os.path.exists(self.prompt_path):
-            return f"Analyze this real estate listing and return JSON: {raw_text}"
-            
-        with open(self.prompt_path, "r") as f:
-            template = f.read()
-            
-        # Inject the raw text into the {text_raw} slot defined in prompts/detective_prompt_v1.md
-        # Defaulting neighborhood to 'Unknown' if not provided by scraper yet
-        return template.replace("{text_raw}", raw_text).replace("{neighborhood}", "Unknown")
+        # Simplified prompt construction, relying on Schema for formatting
+        return f"""
+        Analyze this real estate listing text. Extract the address, neighborhood, and verify if it is an Atelier.
+        
+        LISTING TEXT:
+        {raw_text}
+        """
 
     async def analyze_text(self, text: str) -> Dict[str, Any]:
         """
-        Orchestrates the Tier 1 Analysis.
-        Maps to 'Analysis Tier 1 (Cheap)' in ARCHITECTURE.md.
+        Uses Structured Outputs (JSON Schema) to guarantee valid data.
         """
         if not self.model_flash:
-            # Simulation Response for Dev Mode
             return {
                 "address_prediction": "Simulated Address", 
-                "confidence": 0.0, 
-                "reasoning": "Mock Mode Active"
+                "confidence": 0, 
+                "reasoning_steps": ["Mock Mode"],
+                "is_atelier": False
             }
 
         try:
             prompt = self._load_prompt(text)
             
-            # Force JSON mode for structured data extraction
+            # --- GUARDRAIL IMPLEMENTATION ---
+            # We pass the Pydantic schema to the API configuration
             response = self.model_flash.generate_content(
                 prompt,
-                generation_config={"response_mime_type": "application/json"}
+                generation_config={
+                    "response_mime_type": "application/json",
+                    "response_json_schema": AIAnalysisSchema.model_json_schema() #
+                }
             )
             
-            # Parse the JSON output
-            result = json.loads(response.text)
+            # Validate response against our model
+            # This ensures we never crash downstream due to malformed keys
+            structured_data = AIAnalysisSchema.model_validate_json(response.text)
             
-            # Ensure confidence is an integer for the Logic Gate
-            if "confidence" not in result:
-                result["confidence"] = 0
-                
-            return result
+            return structured_data.model_dump()
 
         except Exception as e:
             print(f"[AI ENGINE] Error: {e}")
-            return {"error": str(e), "confidence": 0.0}
+            return {"error": str(e), "confidence": 0}
 
     async def analyze_images(self, image_urls: list[str]) -> Dict[str, Any]:
-        # Placeholder for Tier 2 Logic
-        return {"building_id": "UNKNOWN", "risk_factors": ["Vision implementation pending"]}
+        # Placeholder
+        return {"confidence": 0, "reasoning": "Vision Not Implemented"}
 
 
 =========================================
@@ -433,6 +487,7 @@ class RealEstateRepository:
 
     def create_listing(self, url: str, price: float, area: float, desc: str) -> Listing:
         clean_url = normalize_url(url)
+        # 1. URL Check (Fastest)
         existing = self.get_listing_by_url(clean_url)
         if existing:
             return existing
@@ -451,12 +506,21 @@ class RealEstateRepository:
     def get_listing_by_url(self, url: str) -> Optional[Listing]:
         return self.db.query(Listing).filter(Listing.source_url == url).first()
 
+    def check_content_duplication(self, content_hash: str) -> Optional[int]:
+        """
+        Returns the ID of an existing listing if the content hash matches.
+        """
+        existing = self.db.query(Listing).filter(Listing.content_hash == content_hash).first()
+        return existing.id if existing else None
+
+    def update_listing_content(self, listing_id: int, description: str, content_hash: str):
+        listing = self.db.query(Listing).get(listing_id)
+        if listing:
+            listing.description_raw = description
+            listing.content_hash = content_hash
+            self.db.commit()
+
     def create_report(self, listing_id: int, risk: int, details: dict, cost: float, confidence: int = 0) -> Report:
-        """
-        Decision Logic:
-        If AI Confidence < 70, the status is MANUAL_REVIEW regardless of risk.
-        If Risk > 80, it's flagged as VERIFIED (but high risk).
-        """
         status = ReportStatus.VERIFIED if confidence >= 70 else ReportStatus.MANUAL_REVIEW
         
         report = Report(
@@ -537,74 +601,109 @@ FILE: ./src/services/scraper_service.py
 =========================================
 from bs4 import BeautifulSoup
 import os
+import httpx
+import random
 
 class ScraperService:
-    def __init__(self, simulation_mode=True):
+    def __init__(self, simulation_mode=False):
         self.simulation = simulation_mode
         self.mock_file = "imot_simulation.html"
+        # Rotate User-Agents to avoid immediate blocking
+        self.user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+        ]
 
     def scrape_url(self, url: str) -> dict:
-        print(f"[SCRAPER] Target: {url}")
+        print(f"[SCRAPER] Target: {url} | Mode: {'SIMULATION' if self.simulation else 'LIVE'}")
         
         html_content = ""
+        
         if self.simulation:
             if not os.path.exists(self.mock_file):
-                return {"error": "Mock file missing"}
+                # Fallback for Docker environments where file might be missing
+                return {"raw_text": "Simulation Error: File missing", "image_urls": [], "price_predicted": 0, "area": 0}
             with open(self.mock_file, "r", encoding="utf-8") as f:
                 html_content = f.read()
-        
+        else:
+            # --- REAL WORLD CONNECTION ---
+            try:
+                headers = {"User-Agent": random.choice(self.user_agents)}
+                with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+                    response = client.get(url, headers=headers)
+                    response.raise_for_status()
+                    html_content = response.text
+            except Exception as e:
+                print(f"[SCRAPER] Network Error: {e}")
+                raise e
+
         soup = BeautifulSoup(html_content, 'html.parser')
         
-        # Extract main text
-        ad_block = soup.find('div', class_='text_desc') # Updated to match your mock HTML
-        raw_text = ad_block.get_text(strip=True) if ad_block else "No text found"
+        # 1. Extract Text
+        # Heuristic: Find the largest text block or specific class
+        ad_block = soup.find('div', class_='text_desc') or soup.find('div', class_='ad-description')
+        raw_text = ad_block.get_text(separator=" ", strip=True) if ad_block else ""
+        
+        if not raw_text and not self.simulation:
+            # Fallback for generic pages
+            raw_text = soup.body.get_text(separator=" ", strip=True)[:2000]
 
-        # NEW: Extract Image URLs (Simulated)
-        # In a real imot.bg scrape, you'd look for <img class="gallery">
-        images = [
-            "https://imot.bg/images/main_facade_1.jpg",
-            "https://imot.bg/images/living_room_2.jpg",
-            "https://imot.bg/images/window_view_3.jpg"
-        ]
+        # 2. Extract Images
+        images = []
+        for img in soup.find_all('img'):
+            src = img.get('src') or img.get('data-src')
+            if src and 'http' in src and ('jpg' in src or 'png' in src):
+                images.append(src)
+        
+        # Limit to top 3 images to save AI Tokens
+        images = images[:3]
         
         return {
             "source_url": url,
             "raw_text": raw_text,
             "image_urls": images,
-            "price_predicted": 185000.0,
-            "area": 85.0
+            "price_predicted": 0, # Parser logic would go here
+            "area": 0 # Parser logic would go here
         }
 
 
 =========================================
 FILE: ./src/services/risk_engine.py
 =========================================
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 class RiskEngine:
-    """
-    Translates architectural and legal discrepancies into a 0-100 Risk Score.
-    """
-    def calculate_score(self, advertised_data: Dict, ai_insights: Dict) -> Dict[str, Any]:
+    def calculate_score(self, advertised_data: Dict, ai_insights: Dict, cadastre_area: Optional[float] = None) -> Dict[str, Any]:
         score = 0
         flags = []
-
-        # 1. Legal Status Check (Atelier vs Apartment)
+        
         raw_text = advertised_data.get("raw_text", "").upper()
-        if "АТЕЛИЕ" in raw_text or "ATELIER" in raw_text:
-            score += 30
-            flags.append("LEGAL_STATUS_RISK: Property listed as Atelier (Possible industrial status)")
+        advertised_area = advertised_data.get("area", 0.0)
 
-        # 2. Floor Logic
+        # 1. LEGAL STATUS (Atelier)
+        # Using the AI's structured output if available, else fallback to text
+        is_atelier = ai_insights.get("is_atelier", False)
+        if is_atelier or "АТЕЛИЕ" in raw_text or "ATELIER" in raw_text:
+            score += 30
+            flags.append("LEGAL_STATUS_RISK: Property is Atelier (Industrial/Non-residential status)")
+
+        # 2. AREA MATH (Advertised vs Cadastre)
+        # The Gap fix: Check if advertised area is suspicious compared to official records
+        if cadastre_area and advertised_area > 0:
+            if advertised_area > (cadastre_area * 1.15): # 15% tolerance
+                score += 20
+                flags.append(f"AREA_DISCREPANCY: Advertised ({advertised_area}) > Cadastre ({cadastre_area})")
+
+        # 3. FLOOR RISKS
         if "ПОСЛЕДЕН" in raw_text or "TOP FLOOR" in raw_text:
             score += 15
-            flags.append("MAINTENANCE_RISK: Top floor (Higher probability of roof leaks)")
+            flags.append("MAINTENANCE_RISK: Top floor")
         
         if "ПЪРВИ" in raw_text or "GROUND" in raw_text:
             score += 10
-            flags.append("SECURITY_RISK: Ground floor/Low elevation")
+            flags.append("SECURITY_RISK: Ground floor")
 
-        # 3. High Value Verification
+        # 4. PRICE ANOMALY
         if advertised_data.get("price_predicted", 0) > 300000:
             score += 5
             flags.append("FINANCIAL: High-ticket verification required")
@@ -616,6 +715,42 @@ class RiskEngine:
 
 
 =========================================
+FILE: ./src/services/cadastre_service.py
+=========================================
+from typing import Optional, Dict
+
+class CadastreService:
+    """
+    Interface for the Official Property Registry (Cadastre).
+    In a real deployment, this would use the official API or a headless browser.
+    """
+    def __init__(self):
+        # In the future, API keys for the government portal go here
+        pass
+
+    def fetch_details(self, address: str) -> Optional[Dict[str, float]]:
+        """
+        Simulates a lookup in the national registry.
+        Returns: { "official_area": 85.0, "year_built": 2005 }
+        """
+        print(f"[CADASTRE] Querying registry for: {address}")
+        
+        # MOCK LOGIC: 
+        # For now, we return 'None' to simulate that most addresses 
+        # cannot be perfectly matched automatically yet.
+        # This prevents the Risk Engine from throwing false positives 
+        # until the real integration is ready.
+        
+        return None 
+        
+        # EXAMPLE REAL IMPLEMENTATION STUB:
+        # response = requests.get(f"https://kais.cadastre.bg/api/search?q={address}")
+        # if response.status_code == 200:
+        #     return response.json()
+        # return None
+
+
+=========================================
 FILE: ./src/__init__.py
 =========================================
 
@@ -624,17 +759,28 @@ FILE: ./src/__init__.py
 FILE: ./src/main.py
 =========================================
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from src.api import routes
-from src.db.session import engine, Base
-
-# Create Tables on Startup (The "Auto-Migration")
-# In production, we would use Alembic, but this is Guerrilla Dev.
-Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Glashaus API",
     description="Automated Real Estate Due Diligence Engine",
-    version="0.1.0"
+    version="1.0.0"
+)
+
+# Allow connections from Frontend/Dashboard
+origins = [
+    "http://localhost",
+    "http://localhost:3000",
+    "http://localhost:8080",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(routes.router)
@@ -644,12 +790,12 @@ def health_check():
     return {
         "system": "GLASHAUS", 
         "status": "OPERATIONAL", 
-        "motto": "Transparenz ist die Währung"
+        "version": "1.0.0-PROD"
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("src.main:app", host="0.0.0.0", port=8000)
 
 
 =========================================
@@ -741,6 +887,128 @@ class Report(Base):
 
     listing = relationship("Listing", back_populates="reports")
     building = relationship("Building", back_populates="reports")
+
+
+=========================================
+FILE: ./src/worker.py
+=========================================
+import os
+from celery import Celery
+from src.core.config import settings
+
+celery_app = Celery(
+    "glashaus_worker",
+    broker=settings.REDIS_URL,
+    backend=settings.REDIS_URL
+)
+
+celery_app.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone="Europe/Sofia",
+    enable_utc=True,
+)
+
+# Auto-discover tasks in src/tasks.py
+celery_app.autodiscover_tasks(['src.tasks'])
+
+
+=========================================
+FILE: ./src/tasks.py
+=========================================
+from src.worker import celery_app
+from src.db.session import SessionLocal
+from src.db.models import Listing
+from src.services.repository import RealEstateRepository
+from src.services.scraper_service import ScraperService
+from src.services.ai_engine import GeminiService
+from src.services.risk_engine import RiskEngine
+from src.services.cadastre_service import CadastreService
+from src.core.config import settings
+from src.core.utils import calculate_content_hash, normalize_address
+import asyncio
+
+@celery_app.task(name="src.tasks.audit_listing")
+def audit_listing_task(listing_id: int):
+    db = SessionLocal()
+    try:
+        repo = RealEstateRepository(db)
+        
+        # TOGGLE: Set simulation_mode=False to go live
+        scraper = ScraperService(simulation_mode=True)
+        
+        ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
+        risk_engine = RiskEngine()
+        cadastre_service = CadastreService()
+
+        listing = db.query(Listing).get(listing_id)
+        if not listing: return "Listing not found"
+
+        # 1. SCRAPE
+        print(f"[TASK] Scraping listing {listing_id}...")
+        try:
+            scraped_data = scraper.scrape_url(listing.source_url)
+        except Exception:
+            return "Scraping Failed"
+            
+        # 2. IDEMPOTENCY
+        current_hash = calculate_content_hash(scraped_data["raw_text"], listing.price_bgn or 0)
+        duplicate_id = repo.check_content_duplication(current_hash)
+        if duplicate_id and duplicate_id != listing.id:
+            repo.update_listing_content(listing.id, scraped_data["raw_text"], current_hash)
+            return "Aborted: Duplicate Content"
+        repo.update_listing_content(listing.id, scraped_data["raw_text"], current_hash)
+
+        # 3. AI ANALYSIS
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        print(f"[TASK] Running AI Tier 1...")
+        tier1_result = loop.run_until_complete(ai_engine.analyze_text(scraped_data["raw_text"]))
+        
+        # 4. CADASTRE LOOKUP (The Outer World Connection)
+        # Use the address found by AI to query the government registry
+        address_found = tier1_result.get("address_prediction", "")
+        clean_address = normalize_address(address_found)
+        cadastre_data = cadastre_service.fetch_details(clean_address)
+        
+        official_area = cadastre_data.get("official_area") if cadastre_data else None
+
+        # 5. TIER 2 VISION
+        confidence = tier1_result.get("confidence", 0)
+        final_ai_data = tier1_result
+        total_cost = 0.04
+
+        if confidence < 80 and settings.GEMINI_API_KEY != "mock-key":
+            tier2_result = loop.run_until_complete(ai_engine.analyze_images(scraped_data["image_urls"]))
+            final_ai_data["vision_insights"] = tier2_result
+            total_cost += 0.22
+            confidence = max(confidence, tier2_result.get("confidence", 0))
+
+        # 6. RISK CALCULATION
+        report_data = risk_engine.calculate_score(
+            scraped_data, 
+            final_ai_data, 
+            cadastre_area=official_area
+        )
+        
+        repo.create_report(
+            listing_id=listing.id,
+            risk=report_data["score"],
+            details={"flags": report_data["flags"], "ai_meta": final_ai_data, "cadastre_match": bool(cadastre_data)},
+            cost=total_cost,
+            confidence=confidence
+        )
+        return "Audit Complete"
+
+    except Exception as e:
+        print(f"[TASK_ERROR] {str(e)}")
+        return f"Failed: {str(e)}"
+    finally:
+        db.close()
 
 
 =========================================
@@ -881,6 +1149,66 @@ ORDER BY r.risk_score DESC;
 
 
 =========================================
+FILE: ./db/migrations/env.py
+=========================================
+from logging.config import fileConfig
+from sqlalchemy import engine_from_config
+from sqlalchemy import pool
+from alembic import context
+import os
+import sys
+
+# Add src to path so we can import models
+sys.path.append(os.getcwd())
+
+from src.db.session import Base
+from src.core.config import settings
+from src.db.models import Listing, Report, Building 
+
+config = context.config
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# Overwrite config URL with Environment Settings
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+
+target_metadata = Base.metadata
+
+def run_migrations_offline() -> None:
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+def run_migrations_online() -> None:
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection, target_metadata=target_metadata
+        )
+
+        with context.begin_transaction():
+            context.run_migrations()
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+
+
+=========================================
 FILE: ./README.md
 =========================================
 # GLASHAUS: The Real Estate Integrity Engine
@@ -909,8 +1237,11 @@ psycopg2-binary==2.9.9
 httpx==0.26.0
 pydantic==2.6.0
 pydantic-settings==2.1.0
-google-generativeai==0.3.2
+google-generativeai>=0.7.0
 beautifulsoup4==4.12.3
+celery==5.3.6
+redis==5.0.1
+alembic==1.13.1
 
 
 =========================================
@@ -979,22 +1310,58 @@ FILE: ./docker-compose.yml
 version: '3.8'
 
 services:
-  # 1. The Glashaus API
+  # 1. GATEWAY (Entry Point)
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+
+  # 2. API (Internal)
   api:
     build: .
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000" # Not mapped to host anymore, only accessible via Nginx
     environment:
       - POSTGRES_SERVER=db
       - POSTGRES_USER=glashaus_user
       - POSTGRES_PASSWORD=secret_password
       - POSTGRES_DB=glashaus_db
+      - REDIS_URL=redis://redis:6379/0
+      # - GEMINI_API_KEY=${GEMINI_API_KEY} # Uncomment for prod
     depends_on:
       - db
+      - redis
     volumes:
-      - ./src:/app/src  # Hot Reload
+      - ./src:/app/src
 
-  # 2. The Database (Postgres + GIS)
+  # 3. WORKER
+  worker:
+    build: .
+    command: celery -A src.worker.celery_app worker --loglevel=info
+    environment:
+      - POSTGRES_SERVER=db
+      - POSTGRES_USER=glashaus_user
+      - POSTGRES_PASSWORD=secret_password
+      - POSTGRES_DB=glashaus_db
+      - REDIS_URL=redis://redis:6379/0
+      # - GEMINI_API_KEY=${GEMINI_API_KEY}
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./src:/app/src
+
+  # 4. REDIS
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  # 5. DB
   db:
     image: postgis/postgis:15-3.4
     volumes:
@@ -1031,3 +1398,78 @@ def test_audit_flow():
     data = response.json()
     assert data["status"] == "QUEUED"
     assert "listing_id" in data
+
+
+=========================================
+FILE: ./alembic.ini
+=========================================
+[alembic]
+script_location = db/migrations
+prepend_sys_path = .
+sqlalchemy.url = driver://user:pass@localhost/dbname
+
+[post_write_hooks]
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+
+
+=========================================
+FILE: ./nginx/nginx.conf
+=========================================
+events {}
+
+http {
+    upstream glashaus_api {
+        server api:8000;
+    }
+
+    server {
+        listen 80;
+        
+        # Proxy all API requests to the FastAPI container
+        location / {
+            proxy_pass http://glashaus_api;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # Health check endpoint
+        location /health {
+            return 200 'alive';
+            add_header Content-Type text/plain;
+        }
+    }
+}
