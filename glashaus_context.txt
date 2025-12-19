@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Fri Dec 19 10:15:18 EET 2025
+Fri Dec 19 11:33:39 EET 2025
 
 
 --- GIT HISTORY ---
-* f639780 (HEAD -> main) feat(legal): implement legal forensic engine and solicitor report generation
+* 2e8f2fa (HEAD -> main) refactor(core): harden backend architecture and implement forensic logic
+* f639780 feat(legal): implement legal forensic engine and solicitor report generation
 * 6489783 feat(core): harden task resilience, abstract providers, and add storage layer
 * a087b30 feat(backend): implement vision layer, harden worker logic, and add regex parsing
 * 4987d66 feat(infra): add Nginx gateway, CORS, and live scraping logic
@@ -404,18 +405,12 @@ def normalize_address(raw_address: str) -> str:
 =========================================
 FILE: ./src/core/sofia_data.py
 =========================================
-# Pillar 1.2 & 2.4: Sofia Rayon Strictness Index
-# Derived from Bulgarian Real Estate Legal Logic
 SOFIA_ADMIN_MAP = {
     "OBORISHTE": {"strictness": 5, "kindergarten_risk": "Critical"},
     "PODUYANE": {"strictness": 5, "kindergarten_risk": "High"},
     "CENTER": {"strictness": 4, "kindergarten_risk": "High"},
-    "CENTRE": {"strictness": 4, "kindergarten_risk": "High"},
     "LOZENETS": {"strictness": 4, "kindergarten_risk": "Moderate"},
     "VITOSHA": {"strictness": 2, "kindergarten_risk": "Low"},
-    "STUDENTSKI": {"strictness": 1, "kindergarten_risk": "Low"},
-    "MLADOST": {"strictness": 3, "kindergarten_risk": "Moderate"},
-    "TRIADITSA": {"strictness": 4, "kindergarten_risk": "High"},
     "KRUSTOVA VADA": {"strictness": 2, "kindergarten_risk": "Low"},
 }
 
@@ -428,93 +423,60 @@ from pydantic import BaseModel, Field
 from src.core.config import settings
 
 class AIAnalysisSchema(BaseModel):
-    address_prediction: str = Field(description="Deduced address")
-    confidence: int = Field(description="Confidence score")
-    neighborhood: str = Field(description="Neighborhood name")
-    is_atelier: bool = Field(description="Is it an Atelier?")
-    net_living_area: float = Field(description="Extracted Net usable area in sq.m")
-    construction_stage: str = Field(description="Akt 14, 15, or 16")
-    construction_year: int = Field(description="Estimated or stated building finish year")
-    exposure: str = Field(description="Exposure like Sever, Yug, Iztok, Zapad")
+    address_prediction: str = Field(description="Extracted address")
+    confidence: int = Field(description="0-100 score")
+    neighborhood: str = Field(description="Rayon name")
+    is_atelier: bool = Field(description="Legal status is atelier")
+    net_living_area: float = Field(description="Usable square meters")
+    construction_year: int = Field(description="Finish year")
 
 class GeminiService:
     def __init__(self, api_key: str):
-        self.api_key = api_key
-        if self.api_key != "mock-key":
-            genai.configure(api_key=self.api_key)
-            self.model_flash = genai.GenerativeModel('gemini-1.5-flash')
-        else:
-            self.model_flash = None
+        if api_key != "mock-key":
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
+        else: self.model = None
 
     async def analyze_text(self, text: str) -> dict:
-        if not self.model_flash:
-            return {"address_prediction": "Mock", "confidence": 0, "neighborhood": "Unknown", 
-                    "is_atelier": False, "net_living_area": 0, "construction_stage": "Unknown", 
-                    "construction_year": 2024, "exposure": "Unknown"}
-        
-        prompt = f"Perform forensic analysis on this property ad and return JSON schema: {text}"
-        response = self.model_flash.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json", "response_json_schema": AIAnalysisSchema.model_json_schema()}
-        )
-        return AIAnalysisSchema.model_validate_json(response.text).model_dump()
+        if not self.model: return {"address_prediction": "Mock", "confidence": 0, "neighborhood": "Unknown", "is_atelier": False, "net_living_area": 0, "construction_year": 2024}
+        prompt = f"Perform forensic property analysis on: {text}"
+        resp = self.model.generate_content(prompt, generation_config={"response_mime_type": "application/json", "response_json_schema": AIAnalysisSchema.model_json_schema()})
+        return AIAnalysisSchema.model_validate_json(resp.text).model_dump()
 
 
 =========================================
 FILE: ./src/services/repository.py
 =========================================
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
-from src.db.models import Listing, Report, ReportStatus, PriceHistory
+from src.db.models import Listing, Report, PriceHistory
 from src.core.utils import normalize_url
-from typing import Optional, List
 
 class RealEstateRepository:
     def __init__(self, db: Session):
         self.db = db
 
     def create_listing_initial(self, url: str) -> Listing:
-        """Atomic create or return existing by URL."""
         clean_url = normalize_url(url)
         existing = self.db.query(Listing).filter(Listing.source_url == clean_url).first()
-        if existing:
-            return existing
-            
-        new_listing = Listing(source_url=clean_url)
-        self.db.add(new_listing)
+        if existing: return existing
+        new_l = Listing(source_url=clean_url)
+        self.db.add(new_l)
         self.db.commit()
-        self.db.refresh(new_listing)
-        return new_listing
+        self.db.refresh(new_l)
+        return new_l
 
     def update_listing_data(self, listing_id: int, price: float, area: float, desc: str, chash: str):
         listing = self.db.query(Listing).get(listing_id)
         if listing:
-            # Price History Logic
             if listing.price_bgn and listing.price_bgn != price:
                 history = PriceHistory(listing_id=listing_id, price_bgn=listing.price_bgn)
                 self.db.add(history)
-            
             listing.price_bgn = price
             listing.advertised_area_sqm = area
             listing.description_raw = desc
             listing.content_hash = chash
             self.db.commit()
-
-    def create_report(self, listing_id: int, risk: int, details: dict, cost: float, confidence: int, images: List[str]) -> Report:
-        status = ReportStatus.VERIFIED if confidence >= 85 else ReportStatus.MANUAL_REVIEW
-        if risk > 60: status = ReportStatus.MANUAL_REVIEW # High risk always needs eyes
-        
-        report = Report(
-            listing_id=listing_id,
-            risk_score=risk,
-            ai_confidence_score=confidence,
-            status=status,
-            discrepancy_details=details,
-            cost_to_generate=cost,
-            image_archive_urls=images
-        )
-        self.db.add(report)
-        self.db.commit()
-        return report
 
 
 =========================================
@@ -790,30 +752,35 @@ FILE: ./src/services/storage_service.py
 =========================================
 import os
 import httpx
+import asyncio
 from typing import List
 
 class StorageService:
-    """Handles archival of listing images to prevent data loss when ads disappear."""
     def __init__(self, upload_dir="storage/archive"):
         self.upload_dir = upload_dir
-        if not os.path.exists(upload_dir):
-            os.makedirs(upload_dir, exist_ok=True)
+        os.makedirs(upload_dir, exist_ok=True)
+
+    async def _download_single(self, client: httpx.AsyncClient, url: str, filename: str) -> str:
+        try:
+            resp = await client.get(url, timeout=7.0)
+            if resp.status_code == 200:
+                path = os.path.join(self.upload_dir, filename)
+                with open(path, "wb") as f:
+                    f.write(resp.content)
+                return path
+        except Exception as e:
+            print(f"Archive Fail: {url} -> {e}")
+        return None
 
     async def archive_images(self, listing_id: int, urls: List[str]) -> List[str]:
-        archived_paths = []
+        if not urls: return []
         async with httpx.AsyncClient() as client:
+            tasks = []
             for i, url in enumerate(urls):
-                try:
-                    resp = await client.get(url, timeout=5.0)
-                    if resp.status_code == 200:
-                        filename = f"listing_{listing_id}_{i}.jpg"
-                        path = os.path.join(self.upload_dir, filename)
-                        with open(path, "wb") as f:
-                            f.write(resp.content)
-                        archived_paths.append(path)
-                except Exception as e:
-                    print(f"Archive fail: {e}")
-        return archived_paths
+                filename = f"listing_{listing_id}_{i}.jpg"
+                tasks.append(self._download_single(client, url, filename))
+            results = await asyncio.gather(*tasks)
+            return [r for r in results if r is not None]
 
 
 =========================================
@@ -1046,7 +1013,6 @@ class ReportStatus(str, enum.Enum):
 
 class Listing(Base):
     __tablename__ = "listings"
-
     id = Column(Integer, primary_key=True, index=True)
     source_url = Column(String, unique=True, nullable=False, index=True)
     content_hash = Column(String(64), index=True)
@@ -1054,9 +1020,20 @@ class Listing(Base):
     advertised_area_sqm = Column(Float)
     description_raw = Column(Text)
     scraped_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    reports = relationship("Report", back_populates="listing")
+    
+    reports = relationship("Report", back_populates="listing", cascade="all, delete-orphan")
     price_history = relationship("PriceHistory", back_populates="listing")
+
+class Building(Base):
+    __tablename__ = "buildings"
+    id = Column(Integer, primary_key=True)
+    cadastre_id = Column(String, unique=True, index=True)
+    address_full = Column(String)
+    # Using float for now for Termux compatibility, Geometry(POINT) for Prod
+    latitude = Column(Float)
+    longitude = Column(Float)
+    construction_year = Column(Integer)
+    reports = relationship("Report", back_populates="building")
 
 class PriceHistory(Base):
     __tablename__ = "price_history"
@@ -1064,35 +1041,21 @@ class PriceHistory(Base):
     listing_id = Column(Integer, ForeignKey("listings.id"))
     price_bgn = Column(Float)
     changed_at = Column(DateTime(timezone=True), server_default=func.now())
-    
     listing = relationship("Listing", back_populates="price_history")
-
-class Building(Base):
-    __tablename__ = "buildings"
-    id = Column(Integer, primary_key=True)
-    cadastre_id = Column(String, unique=True, index=True)
-    address_full = Column(String)
-    latitude = Column(Float)
-    longitude = Column(Float)
-    construction_year = Column(Integer)
-    
-    reports = relationship("Report", back_populates="building")
 
 class Report(Base):
     __tablename__ = "reports"
     id = Column(Integer, primary_key=True, index=True)
     listing_id = Column(Integer, ForeignKey("listings.id"))
     building_id = Column(Integer, ForeignKey("buildings.id"), nullable=True)
-    
     status = Column(Enum(ReportStatus), default=ReportStatus.PENDING)
     risk_score = Column(Integer)
     ai_confidence_score = Column(Integer, default=0)
-    
+    legal_brief = Column(Text)
     discrepancy_details = Column(JSON)
-    image_archive_urls = Column(JSON) # Store URLs of backed-up images
+    image_archive_urls = Column(JSON)
     cost_to_generate = Column(Float)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-
     listing = relationship("Listing", back_populates="reports")
     building = relationship("Building", back_populates="reports")
 
@@ -1132,53 +1095,75 @@ from src.services.scraper_service import ScraperService
 from src.services.ai_engine import GeminiService
 from src.services.legal_engine import LegalEngine
 from src.services.report_generator import AttorneyReportGenerator
+from src.services.storage_service import StorageService
+from src.services.repository import RealEstateRepository
+from src.core.utils import calculate_content_hash
 from src.core.config import settings
 import asyncio
 
-@celery_app.task(name="src.tasks.audit_listing")
-def audit_listing_task(listing_id: int):
+@celery_app.task(
+    name="src.tasks.audit_listing",
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    max_retries=5
+)
+def audit_listing_task(self, listing_id: int):
     db = SessionLocal()
+    loop = asyncio.get_event_loop()
     try:
+        repo = RealEstateRepository(db)
         scraper = ScraperService(simulation_mode=(settings.GEMINI_API_KEY == "mock-key"))
         ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
+        storage = StorageService()
         legal_engine = LegalEngine()
         brief_gen = AttorneyReportGenerator()
 
         listing = db.query(Listing).get(listing_id)
-        if not listing: return "Listing not found"
+        if not listing: return "Error: Listing not found"
 
-        # 1. Scraping
+        # 1. Scrape
         scraped_data = scraper.scrape_url(listing.source_url)
         
-        # 2. Tier 1 AI Forensic Analysis
-        loop = asyncio.get_event_loop()
+        # 2. Parallel Archive Images
+        archived_paths = loop.run_until_complete(
+            storage.archive_images(listing_id, scraped_data["image_urls"])
+        )
+
+        # 3. Update Meta
+        chash = calculate_content_hash(scraped_data["raw_text"], scraped_data["price_predicted"])
+        repo.update_listing_data(listing_id, scraped_data["price_predicted"], 
+                                 scraped_data["area"], scraped_data["raw_text"], chash)
+
+        # 4. AI Analysis
         ai_data = loop.run_until_complete(ai_engine.analyze_text(scraped_data["raw_text"]))
 
-        # 3. Apply Professional Legal Logic
-        legal_results = legal_engine.analyze_listing(scraped_data, ai_data)
-        legal_brief = brief_gen.generate_legal_brief(scraped_data, legal_results, ai_data)
+        # 5. Legal Logic
+        legal_res = legal_engine.analyze_listing(scraped_data, ai_data)
+        brief = brief_gen.generate_legal_brief(scraped_data, legal_res, ai_data)
 
-        # 4. Status Determination (The "Kill Switch")
-        status = ReportStatus.VERIFIED if legal_results["total_legal_score"] < 40 else ReportStatus.MANUAL_REVIEW
-        if legal_results["gatekeeper_verdict"] == "ABORT":
-            status = ReportStatus.REJECTED
+        # 6. Verdict
+        status = ReportStatus.VERIFIED if legal_res["total_legal_score"] < 40 else ReportStatus.MANUAL_REVIEW
+        if legal_res.get("gatekeeper_verdict") == "ABORT": status = ReportStatus.REJECTED
 
-        # 5. Commit Audit Report
+        # 7. Final Report
         report = Report(
-            listing_id=listing.id,
+            listing_id=listing_id,
             status=status,
-            risk_score=legal_results["total_legal_score"],
-            ai_confidence_score=ai_data["confidence"],
-            manual_review_notes=legal_brief,
-            discrepancy_details=legal_results
+            risk_score=legal_res["total_legal_score"],
+            ai_confidence_score=ai_data.get("confidence", 0),
+            legal_brief=brief,
+            discrepancy_details=legal_res,
+            image_archive_urls=archived_paths,
+            cost_to_generate=0.04
         )
         db.add(report)
         db.commit()
-        return f"Audit Complete: Verdict {status}"
+        return f"Audit Done: {status}"
 
-    except Exception as e:
-        print(f"[TASK_ERROR] {str(e)}")
-        return f"Failed: {str(e)}"
+    except Exception as exc:
+        db.rollback()
+        raise self.retry(exc=exc)
     finally:
         db.close()
 

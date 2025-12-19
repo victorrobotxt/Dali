@@ -19,60 +19,72 @@ import asyncio
     max_retries=5
 )
 def audit_listing_task(self, listing_id: int):
-    db = SessionLocal()
-    loop = asyncio.get_event_loop()
-    try:
-        repo = RealEstateRepository(db)
-        scraper = ScraperService(simulation_mode=(settings.GEMINI_API_KEY == "mock-key"))
-        ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
-        storage = StorageService()
-        legal_engine = LegalEngine()
-        brief_gen = AttorneyReportGenerator()
+    # FIX: Use Context Manager for robust session handling to prevent connection leaks
+    with SessionLocal() as db:
+        try:
+            # Initialize services that require DB access inside the context
+            repo = RealEstateRepository(db)
+            
+            # Initialize stateless services
+            scraper = ScraperService(simulation_mode=(settings.GEMINI_API_KEY == "mock-key"))
+            ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
+            storage = StorageService()
+            legal_engine = LegalEngine()
+            brief_gen = AttorneyReportGenerator()
 
-        listing = db.query(Listing).get(listing_id)
-        if not listing: return "Error: Listing not found"
+            listing = db.query(Listing).get(listing_id)
+            if not listing:
+                return "Error: Listing not found"
 
-        # 1. Scrape
-        scraped_data = scraper.scrape_url(listing.source_url)
-        
-        # 2. Parallel Archive Images
-        archived_paths = loop.run_until_complete(
-            storage.archive_images(listing_id, scraped_data["image_urls"])
-        )
+            # 1. Scrape (Synchronous)
+            scraped_data = scraper.scrape_url(listing.source_url)
+            
+            # 2. Async Wrapper for I/O bound tasks (Archive + AI)
+            async def run_async_tasks():
+                # Parallelize where possible
+                images_task = storage.archive_images(listing_id, scraped_data["image_urls"])
+                ai_task = ai_engine.analyze_text(scraped_data["raw_text"])
+                return await asyncio.gather(images_task, ai_task)
 
-        # 3. Update Meta
-        chash = calculate_content_hash(scraped_data["raw_text"], scraped_data["price_predicted"])
-        repo.update_listing_data(listing_id, scraped_data["price_predicted"], 
-                                 scraped_data["area"], scraped_data["raw_text"], chash)
+            # Execute Async Block
+            archived_paths, ai_data = asyncio.run(run_async_tasks())
 
-        # 4. AI Analysis
-        ai_data = loop.run_until_complete(ai_engine.analyze_text(scraped_data["raw_text"]))
+            # 3. Update Listing Metadata
+            chash = calculate_content_hash(scraped_data["raw_text"], scraped_data["price_predicted"])
+            repo.update_listing_data(
+                listing_id, 
+                scraped_data["price_predicted"], 
+                scraped_data["area"], 
+                scraped_data["raw_text"], 
+                chash
+            )
 
-        # 5. Legal Logic
-        legal_res = legal_engine.analyze_listing(scraped_data, ai_data)
-        brief = brief_gen.generate_legal_brief(scraped_data, legal_res, ai_data)
+            # 4. Legal Logic & Verdict
+            legal_res = legal_engine.analyze_listing(scraped_data, ai_data)
+            brief = brief_gen.generate_legal_brief(scraped_data, legal_res, ai_data)
 
-        # 6. Verdict
-        status = ReportStatus.VERIFIED if legal_res["total_legal_score"] < 40 else ReportStatus.MANUAL_REVIEW
-        if legal_res.get("gatekeeper_verdict") == "ABORT": status = ReportStatus.REJECTED
+            # Logic: Automatic rejection if specific fatal flags exist
+            status = ReportStatus.VERIFIED if legal_res["total_legal_score"] < 40 else ReportStatus.MANUAL_REVIEW
+            if legal_res.get("gatekeeper_verdict") == "ABORT":
+                status = ReportStatus.REJECTED
 
-        # 7. Final Report
-        report = Report(
-            listing_id=listing_id,
-            status=status,
-            risk_score=legal_res["total_legal_score"],
-            ai_confidence_score=ai_data.get("confidence", 0),
-            legal_brief=brief,
-            discrepancy_details=legal_res,
-            image_archive_urls=archived_paths,
-            cost_to_generate=0.04
-        )
-        db.add(report)
-        db.commit()
-        return f"Audit Done: {status}"
+            # 5. Final Report
+            report = Report(
+                listing_id=listing_id,
+                status=status,
+                risk_score=legal_res["total_legal_score"],
+                ai_confidence_score=ai_data.get("confidence", 0),
+                legal_brief=brief,
+                discrepancy_details=legal_res,
+                image_archive_urls=archived_paths,
+                cost_to_generate=0.04
+            )
+            db.add(report)
+            db.commit()
+            
+            return f"Audit Complete: {status} (Score: {legal_res['total_legal_score']})"
 
-    except Exception as exc:
-        db.rollback()
-        raise self.retry(exc=exc)
-    finally:
-        db.close()
+        except Exception as exc:
+            db.rollback()
+            # Re-raise to trigger Celery's autoretry
+            raise exc
