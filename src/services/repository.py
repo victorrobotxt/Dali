@@ -9,6 +9,7 @@ class RealEstateRepository:
 
     def create_listing(self, url: str, price: float, area: float, desc: str) -> Listing:
         clean_url = normalize_url(url)
+        # 1. URL Check (Fastest)
         existing = self.get_listing_by_url(clean_url)
         if existing:
             return existing
@@ -27,12 +28,21 @@ class RealEstateRepository:
     def get_listing_by_url(self, url: str) -> Optional[Listing]:
         return self.db.query(Listing).filter(Listing.source_url == url).first()
 
+    def check_content_duplication(self, content_hash: str) -> Optional[int]:
+        """
+        Returns the ID of an existing listing if the content hash matches.
+        """
+        existing = self.db.query(Listing).filter(Listing.content_hash == content_hash).first()
+        return existing.id if existing else None
+
+    def update_listing_content(self, listing_id: int, description: str, content_hash: str):
+        listing = self.db.query(Listing).get(listing_id)
+        if listing:
+            listing.description_raw = description
+            listing.content_hash = content_hash
+            self.db.commit()
+
     def create_report(self, listing_id: int, risk: int, details: dict, cost: float, confidence: int = 0) -> Report:
-        """
-        Decision Logic:
-        If AI Confidence < 70, the status is MANUAL_REVIEW regardless of risk.
-        If Risk > 80, it's flagged as VERIFIED (but high risk).
-        """
         status = ReportStatus.VERIFIED if confidence >= 70 else ReportStatus.MANUAL_REVIEW
         
         report = Report(
