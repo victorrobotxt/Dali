@@ -19,6 +19,7 @@ class ScraperService:
         }
 
     async def scrape_url(self, url: str) -> ScrapedListing:
+        # Standardize to mobile to reduce WAF friction
         clean_url = url.replace("www.imot.bg", "m.imot.bg")
         log = logger.bind(url=clean_url)
         
@@ -58,7 +59,7 @@ class ScraperService:
             try:
                 await page.goto(url, wait_until="domcontentloaded")
                 
-                # Wait for WAF to clear or price to appear (Max 10s)
+                # Wait for core data to appear (Max 10s)
                 try:
                     await page.wait_for_selector('div#price, .price, .advHeader', timeout=10000)
                 except Exception:
@@ -75,26 +76,41 @@ class ScraperService:
         soup = BeautifulSoup(content, 'html.parser')
         text = soup.get_text(" ", strip=True)
 
-        # Price Parsing
+        # 1. Price Parsing
         p_match = re.search(r'([\d\s\.,]+)\s?(?:EUR|€|лв)', text)
         price_decimal = Decimal("0.00")
         if p_match:
             try:
                 clean_str = re.sub(r'[^\d]', '', p_match.group(1))
                 price_decimal = Decimal(clean_str)
-            except InvalidOperation:
+            except (InvalidOperation, ValueError):
                 logger.warning("price_parse_failed", url=url)
 
-        # Area Parsing
+        # 2. Area Parsing
         a_match = re.search(r'(\d+)\s?(?:kv|кв)', text.lower())
         area = Decimal(a_match.group(1)) if a_match else Decimal("0.00")
         
-        images = [img.get('src') for img in soup.find_all('img') if 'imot.bg' in (img.get('src') or "")]
+        # 3. Neighborhood Extraction (Crucial for Geo-Forensics)
+        # Matches patterns like "Люлин 6, град София" or "град София, Люлин 6"
+        kv_match = re.search(r'([\w\s\d-]+),\s*град София', text)
+        if not kv_match:
+            kv_match = re.search(r'град София,\s*([\w\s\d-]+)', text)
+        
+        neighborhood = kv_match.group(1).strip() if kv_match else "Unknown"
+
+        # 4. Image Extraction
+        images = []
+        for img in soup.find_all('img'):
+            src = img.get('src') or img.get('data-src')
+            if src and 'imot.bg' in src and 'picturess' in src:
+                if src.startswith("//"): src = "https:" + src
+                images.append(src)
 
         return ScrapedListing(
             source_url=url,
             raw_text=text,
             price_predicted=price_decimal,
             area_sqm=area,
-            image_urls=images
+            neighborhood=neighborhood,
+            image_urls=list(set(images)) # Deduplicate
         )

@@ -7,8 +7,9 @@ class Settings(BaseSettings):
     VERSION: str = "1.0.0-PROD"
     ENV: str = Field("DEV", description="DEV or PROD")
     
-    # SECURITY FIX: No default value. Fails safely if missing.
-    GEMINI_API_KEY: str = Field(..., min_length=10, description="Must be set in .env")
+    # API KEYS
+    GEMINI_API_KEY: str = Field(..., min_length=10, description="Google Gemini API Key")
+    GOOGLE_MAPS_API_KEY: str = Field(..., min_length=10, description="Google Maps Geocoding API Key")
     
     # Database
     POSTGRES_USER: str = Field(..., min_length=1)
