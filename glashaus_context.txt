@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Fri Dec 19 08:37:58 EET 2025
+Fri Dec 19 08:44:46 EET 2025
 
 
 --- GIT HISTORY ---
-* 4987d66 (HEAD -> main) feat(infra): add Nginx gateway, CORS, and live scraping logic
+* a087b30 (HEAD -> main) feat(backend): implement vision layer, harden worker logic, and add regex parsing
+* 4987d66 feat(infra): add Nginx gateway, CORS, and live scraping logic
 * ae76a80 refactor(core): upgrade architecture to Celery/Redis and harden AI logic
 * b7f3797 refactor(core): migrate to Redis/Celery queue and add Alembic migrations
 * f22a7da feat(core): implement AI engine, workflow logic, and docs
@@ -38,6 +39,7 @@ Fri Dec 19 08:37:58 EET 2025
 ./src/services/scraper_service.py
 ./src/services/risk_engine.py
 ./src/services/cadastre_service.py
+./src/services/geospatial_service.py
 ./src/models
 ./src/__init__.py
 ./src/main.py
@@ -395,17 +397,15 @@ FILE: ./src/services/ai_engine.py
 =========================================
 import google.generativeai as genai
 import json
-import os
+import httpx
+import io
+from PIL import Image
 from typing import Dict, Any, List, Optional
 from src.core.config import settings
 from pydantic import BaseModel, Field
 
-# --- PYDANTIC SCHEMA FOR GUARDRAILS ---
+# --- PYDANTIC SCHEMA ---
 class AIAnalysisSchema(BaseModel):
-    """
-    Enforces structure on the LLM output.
-    Ref: Google GenAI SDK Docs
-    """
     address_prediction: str = Field(description="The deduced street address")
     confidence: int = Field(ge=0, le=100, description="Confidence score 0-100")
     reasoning_steps: List[str] = Field(description="Bullet points explaining the deduction")
@@ -425,18 +425,14 @@ class GeminiService:
             self.model_pro = None
 
     def _load_prompt(self, raw_text: str) -> str:
-        # Simplified prompt construction, relying on Schema for formatting
         return f"""
-        Analyze this real estate listing text. Extract the address, neighborhood, and verify if it is an Atelier.
-        
+        Analyze this real estate listing text.
+        Extract the address, neighborhood, and verify if it is an Atelier.
         LISTING TEXT:
         {raw_text}
         """
 
     async def analyze_text(self, text: str) -> Dict[str, Any]:
-        """
-        Uses Structured Outputs (JSON Schema) to guarantee valid data.
-        """
         if not self.model_flash:
             return {
                 "address_prediction": "Simulated Address", 
@@ -447,30 +443,65 @@ class GeminiService:
 
         try:
             prompt = self._load_prompt(text)
-            
-            # --- GUARDRAIL IMPLEMENTATION ---
-            # We pass the Pydantic schema to the API configuration
             response = self.model_flash.generate_content(
                 prompt,
                 generation_config={
                     "response_mime_type": "application/json",
-                    "response_json_schema": AIAnalysisSchema.model_json_schema() #
+                    "response_json_schema": AIAnalysisSchema.model_json_schema()
                 }
             )
-            
-            # Validate response against our model
-            # This ensures we never crash downstream due to malformed keys
             structured_data = AIAnalysisSchema.model_validate_json(response.text)
-            
             return structured_data.model_dump()
 
         except Exception as e:
-            print(f"[AI ENGINE] Error: {e}")
+            print(f"[AI ENGINE] Text Error: {e}")
             return {"error": str(e), "confidence": 0}
 
     async def analyze_images(self, image_urls: list[str]) -> Dict[str, Any]:
-        # Placeholder
-        return {"confidence": 0, "reasoning": "Vision Not Implemented"}
+        """
+        Downloads images and performs Visual Detective analysis.
+        """
+        if not self.model_pro:
+            return {"confidence": 0, "reasoning": "Vision Mock Mode"}
+
+        images_payload = []
+        
+        # 1. Download images into memory
+        async with httpx.AsyncClient() as client:
+            for url in image_urls:
+                try:
+                    # Filter out empty or invalid URLs
+                    if not url or not url.startswith('http'): continue
+                    
+                    resp = await client.get(url, timeout=5.0)
+                    if resp.status_code == 200:
+                        img = Image.open(io.BytesIO(resp.content))
+                        images_payload.append(img)
+                except Exception as e:
+                    print(f"[AI VISION] Download failed for {url}: {e}")
+
+        if not images_payload:
+            return {"confidence": 0, "reasoning": "No valid images downloaded"}
+
+        # 2. Prompt Gemini Pro Vision
+        prompt = """
+        Act as a geospatial detective. Analyze these real estate photos.
+        1. Identify any unique landmarks (View from window).
+        2. Estimate building era based on facade/balcony style.
+        3. Look for street signs or shop names.
+        Return JSON with 'facade_era', 'landmarks_detected', and 'estimated_location_confidence'.
+        """
+        
+        try:
+            # Gemini Pro Vision handles list of [Prompt, Image, Image...]
+            response = self.model_pro.generate_content(
+                contents=[prompt, *images_payload],
+                generation_config={"response_mime_type": "application/json"}
+            )
+            return json.loads(response.text)
+        except Exception as e:
+            print(f"[AI VISION ERROR] {e}")
+            return {"confidence": 0, "error": str(e)}
 
 
 =========================================
@@ -603,16 +634,38 @@ from bs4 import BeautifulSoup
 import os
 import httpx
 import random
+import re
 
 class ScraperService:
     def __init__(self, simulation_mode=False):
         self.simulation = simulation_mode
         self.mock_file = "imot_simulation.html"
-        # Rotate User-Agents to avoid immediate blocking
         self.user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
         ]
+
+    def _parse_price(self, text: str) -> float:
+        # Matches: 185 000 EUR, 185000, 185.000
+        match = re.search(r'([\d\s\.,]+)\s?(?:EUR|€|leva|BGN)', text, re.IGNORECASE)
+        if match:
+            clean = match.group(1).replace(" ", "").replace(",", "").strip()
+            try:
+                return float(clean)
+            except ValueError:
+                return 0.0
+        return 0.0
+
+    def _parse_area(self, text: str) -> float:
+        # Matches: 85 kv.m, 85 m2, 85 кв.м
+        match = re.search(r'([\d\.,]+)\s?(?:kv|m2|кв)', text, re.IGNORECASE)
+        if match:
+            clean = match.group(1).replace(",", ".").strip()
+            try:
+                return float(clean)
+            except ValueError:
+                return 0.0
+        return 0.0
 
     def scrape_url(self, url: str) -> dict:
         print(f"[SCRAPER] Target: {url} | Mode: {'SIMULATION' if self.simulation else 'LIVE'}")
@@ -621,12 +674,10 @@ class ScraperService:
         
         if self.simulation:
             if not os.path.exists(self.mock_file):
-                # Fallback for Docker environments where file might be missing
                 return {"raw_text": "Simulation Error: File missing", "image_urls": [], "price_predicted": 0, "area": 0}
             with open(self.mock_file, "r", encoding="utf-8") as f:
                 html_content = f.read()
         else:
-            # --- REAL WORLD CONNECTION ---
             try:
                 headers = {"User-Agent": random.choice(self.user_agents)}
                 with httpx.Client(timeout=10.0, follow_redirects=True) as client:
@@ -640,30 +691,30 @@ class ScraperService:
         soup = BeautifulSoup(html_content, 'html.parser')
         
         # 1. Extract Text
-        # Heuristic: Find the largest text block or specific class
         ad_block = soup.find('div', class_='text_desc') or soup.find('div', class_='ad-description')
         raw_text = ad_block.get_text(separator=" ", strip=True) if ad_block else ""
         
         if not raw_text and not self.simulation:
-            # Fallback for generic pages
             raw_text = soup.body.get_text(separator=" ", strip=True)[:2000]
 
-        # 2. Extract Images
+        # 2. Extract Images (Limit 3)
         images = []
         for img in soup.find_all('img'):
             src = img.get('src') or img.get('data-src')
             if src and 'http' in src and ('jpg' in src or 'png' in src):
                 images.append(src)
-        
-        # Limit to top 3 images to save AI Tokens
         images = images[:3]
         
+        # 3. Parse Metadata
+        price = self._parse_price(raw_text)
+        area = self._parse_area(raw_text)
+
         return {
             "source_url": url,
             "raw_text": raw_text,
             "image_urls": images,
-            "price_predicted": 0, # Parser logic would go here
-            "area": 0 # Parser logic would go here
+            "price_predicted": price,
+            "area": area
         }
 
 
@@ -748,6 +799,30 @@ class CadastreService:
         # if response.status_code == 200:
         #     return response.json()
         # return None
+
+
+=========================================
+FILE: ./src/services/geospatial_service.py
+=========================================
+from typing import Optional, Dict
+
+class GeospatialService:
+    """
+    Handles Google Maps / Street View verification.
+    """
+    def __init__(self, api_key: str = "mock-key"):
+        self.api_key = api_key
+
+    def verify_location(self, address: str) -> Dict[str, any]:
+        """
+        TODO: Implement Google Maps Geocoding API.
+        Should return { "lat": float, "lng": float, "street_view_exists": bool }
+        """
+        if self.api_key == "mock-key":
+            return {"lat": 42.6977, "lng": 23.3219, "verified": False}
+        
+        # Real implementation will go here
+        return {}
 
 
 =========================================
@@ -919,12 +994,13 @@ FILE: ./src/tasks.py
 =========================================
 from src.worker import celery_app
 from src.db.session import SessionLocal
-from src.db.models import Listing
+from src.db.models import Listing, Report, ReportStatus
 from src.services.repository import RealEstateRepository
 from src.services.scraper_service import ScraperService
 from src.services.ai_engine import GeminiService
 from src.services.risk_engine import RiskEngine
 from src.services.cadastre_service import CadastreService
+from src.services.geospatial_service import GeospatialService
 from src.core.config import settings
 from src.core.utils import calculate_content_hash, normalize_address
 import asyncio
@@ -935,22 +1011,19 @@ def audit_listing_task(listing_id: int):
     try:
         repo = RealEstateRepository(db)
         
-        # TOGGLE: Set simulation_mode=False to go live
-        scraper = ScraperService(simulation_mode=True)
-        
+        # Initialize Services
+        scraper = ScraperService(simulation_mode=(settings.GEMINI_API_KEY == "mock-key"))
         ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
         risk_engine = RiskEngine()
         cadastre_service = CadastreService()
+        geo_service = GeospatialService() # Ready for future use
 
         listing = db.query(Listing).get(listing_id)
         if not listing: return "Listing not found"
 
         # 1. SCRAPE
         print(f"[TASK] Scraping listing {listing_id}...")
-        try:
-            scraped_data = scraper.scrape_url(listing.source_url)
-        except Exception:
-            return "Scraping Failed"
+        scraped_data = scraper.scrape_url(listing.source_url)
             
         # 2. IDEMPOTENCY
         current_hash = calculate_content_hash(scraped_data["raw_text"], listing.price_bgn or 0)
@@ -960,7 +1033,7 @@ def audit_listing_task(listing_id: int):
             return "Aborted: Duplicate Content"
         repo.update_listing_content(listing.id, scraped_data["raw_text"], current_hash)
 
-        # 3. AI ANALYSIS
+        # 3. AI ANALYSIS (Async in Sync Worker)
         loop = asyncio.get_event_loop()
         if loop.is_closed():
             loop = asyncio.new_event_loop()
@@ -969,24 +1042,27 @@ def audit_listing_task(listing_id: int):
         print(f"[TASK] Running AI Tier 1...")
         tier1_result = loop.run_until_complete(ai_engine.analyze_text(scraped_data["raw_text"]))
         
-        # 4. CADASTRE LOOKUP (The Outer World Connection)
-        # Use the address found by AI to query the government registry
+        # 4. EXTERNAL DATA (Cadastre)
         address_found = tier1_result.get("address_prediction", "")
         clean_address = normalize_address(address_found)
         cadastre_data = cadastre_service.fetch_details(clean_address)
         
         official_area = cadastre_data.get("official_area") if cadastre_data else None
 
-        # 5. TIER 2 VISION
+        # 5. TIER 2 VISION (Conditional)
         confidence = tier1_result.get("confidence", 0)
         final_ai_data = tier1_result
         total_cost = 0.04
 
-        if confidence < 80 and settings.GEMINI_API_KEY != "mock-key":
+        # Trigger Vision if confidence is low OR if it looks like an Atelier
+        if (confidence < 80 or final_ai_data.get("is_atelier")) and settings.GEMINI_API_KEY != "mock-key":
+            print(f"[TASK] Escalating to Tier 2 Vision...")
             tier2_result = loop.run_until_complete(ai_engine.analyze_images(scraped_data["image_urls"]))
             final_ai_data["vision_insights"] = tier2_result
             total_cost += 0.22
-            confidence = max(confidence, tier2_result.get("confidence", 0))
+            # Boost confidence if vision found landmarks
+            if tier2_result.get("estimated_location_confidence", 0) > 50:
+                confidence = max(confidence, 85)
 
         # 6. RISK CALCULATION
         report_data = risk_engine.calculate_score(
@@ -1006,6 +1082,23 @@ def audit_listing_task(listing_id: int):
 
     except Exception as e:
         print(f"[TASK_ERROR] {str(e)}")
+        # FAIL-SAFE: Update DB to REJECTED so UI doesn't hang
+        try:
+            # Re-connect in case main session is dead
+            error_db = SessionLocal()
+            error_report = error_db.query(Report).filter(Report.listing_id == listing_id).first()
+            if not error_report:
+                error_report = Report(listing_id=listing_id, status=ReportStatus.REJECTED)
+                error_db.add(error_report)
+            else:
+                error_report.status = ReportStatus.REJECTED
+            
+            error_report.manual_review_notes = f"System Error: {str(e)}"
+            error_db.commit()
+            error_db.close()
+        except Exception as db_e:
+            print(f"[CRITICAL DB ERROR] {db_e}")
+            
         return f"Failed: {str(e)}"
     finally:
         db.close()
@@ -1242,6 +1335,7 @@ beautifulsoup4==4.12.3
 celery==5.3.6
 redis==5.0.1
 alembic==1.13.1
+Pillow==10.2.0
 
 
 =========================================

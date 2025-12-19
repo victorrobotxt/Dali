@@ -1,42 +1,34 @@
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 
 class RiskEngine:
-    def calculate_score(self, advertised_data: Dict, ai_insights: Dict, cadastre_area: Optional[float] = None) -> Dict[str, Any]:
+    def calculate_score(self, advertised: Dict, ai: Dict, cadastre_area: Optional[float] = None) -> Dict[str, Any]:
         score = 0
         flags = []
         
-        raw_text = advertised_data.get("raw_text", "").upper()
-        advertised_area = advertised_data.get("area", 0.0)
+        # 1. LEGAL / ATELIER
+        if ai.get("is_atelier", False):
+            score += 40
+            flags.append("LEGAL: Property registered as Atelier (non-residential). Potential loan issues.")
 
-        # 1. LEGAL STATUS (Atelier)
-        # Using the AI's structured output if available, else fallback to text
-        is_atelier = ai_insights.get("is_atelier", False)
-        if is_atelier or "АТЕЛИЕ" in raw_text or "ATELIER" in raw_text:
-            score += 30
-            flags.append("LEGAL_STATUS_RISK: Property is Atelier (Industrial/Non-residential status)")
+        # 2. AREA SQUEEZING
+        adv_area = advertised.get("area", 0)
+        if cadastre_area and adv_area > 0:
+            diff = (adv_area - cadastre_area) / cadastre_area
+            if diff > 0.20:
+                score += 30
+                flags.append(f"AREA: Advertised area is {diff:.1%} larger than Cadastre record.")
 
-        # 2. AREA MATH (Advertised vs Cadastre)
-        # The Gap fix: Check if advertised area is suspicious compared to official records
-        if cadastre_area and advertised_area > 0:
-            if advertised_area > (cadastre_area * 1.15): # 15% tolerance
-                score += 20
-                flags.append(f"AREA_DISCREPANCY: Advertised ({advertised_area}) > Cadastre ({cadastre_area})")
-
-        # 3. FLOOR RISKS
-        if "ПОСЛЕДЕН" in raw_text or "TOP FLOOR" in raw_text:
-            score += 15
-            flags.append("MAINTENANCE_RISK: Top floor")
-        
-        if "ПЪРВИ" in raw_text or "GROUND" in raw_text:
-            score += 10
-            flags.append("SECURITY_RISK: Ground floor")
-
-        # 4. PRICE ANOMALY
-        if advertised_data.get("price_predicted", 0) > 300000:
+        # 3. HEATING / UTILITIES (Sofia Specific)
+        vision = ai.get("vision_insights", {})
+        heating = vision.get("heating_source", "unknown").lower()
+        if "electricity" in heating or "air conditioning" in heating:
             score += 5
-            flags.append("FINANCIAL: High-ticket verification required")
+            flags.append("COST: Heating is electric (expected higher winter bills).")
+        
+        # 4. FLOOR POSITION
+        raw_text = advertised.get("raw_text", "").lower()
+        if any(x in raw_text for x in ["първи", "партер", "ground"]):
+            score += 15
+            flags.append("SECURITY: Ground floor unit.")
 
-        return {
-            "score": min(score, 100),
-            "flags": flags
-        }
+        return {"score": min(score, 100), "flags": flags}
