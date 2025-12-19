@@ -1,9 +1,11 @@
 --- GLASHAUS PROJECT DUMP ---
-Fri Dec 19 08:44:46 EET 2025
+Fri Dec 19 10:15:18 EET 2025
 
 
 --- GIT HISTORY ---
-* a087b30 (HEAD -> main) feat(backend): implement vision layer, harden worker logic, and add regex parsing
+* f639780 (HEAD -> main) feat(legal): implement legal forensic engine and solicitor report generation
+* 6489783 feat(core): harden task resilience, abstract providers, and add storage layer
+* a087b30 feat(backend): implement vision layer, harden worker logic, and add regex parsing
 * 4987d66 feat(infra): add Nginx gateway, CORS, and live scraping logic
 * ae76a80 refactor(core): upgrade architecture to Celery/Redis and harden AI logic
 * b7f3797 refactor(core): migrate to Redis/Celery queue and add Alembic migrations
@@ -32,6 +34,7 @@ Fri Dec 19 08:44:46 EET 2025
 ./src/core
 ./src/core/config.py
 ./src/core/utils.py
+./src/core/sofia_data.py
 ./src/services
 ./src/services/ai_engine.py
 ./src/services/repository.py
@@ -40,6 +43,10 @@ Fri Dec 19 08:44:46 EET 2025
 ./src/services/risk_engine.py
 ./src/services/cadastre_service.py
 ./src/services/geospatial_service.py
+./src/services/base_provider.py
+./src/services/storage_service.py
+./src/services/legal_engine.py
+./src/services/report_generator.py
 ./src/models
 ./src/__init__.py
 ./src/main.py
@@ -68,6 +75,8 @@ Fri Dec 19 08:44:46 EET 2025
 ./alembic.ini
 ./nginx
 ./nginx/nginx.conf
+./storage
+./storage/archive
 
 
 --- FILE CONTENTS ---
@@ -393,166 +402,106 @@ def normalize_address(raw_address: str) -> str:
 
 
 =========================================
+FILE: ./src/core/sofia_data.py
+=========================================
+# Pillar 1.2 & 2.4: Sofia Rayon Strictness Index
+# Derived from Bulgarian Real Estate Legal Logic
+SOFIA_ADMIN_MAP = {
+    "OBORISHTE": {"strictness": 5, "kindergarten_risk": "Critical"},
+    "PODUYANE": {"strictness": 5, "kindergarten_risk": "High"},
+    "CENTER": {"strictness": 4, "kindergarten_risk": "High"},
+    "CENTRE": {"strictness": 4, "kindergarten_risk": "High"},
+    "LOZENETS": {"strictness": 4, "kindergarten_risk": "Moderate"},
+    "VITOSHA": {"strictness": 2, "kindergarten_risk": "Low"},
+    "STUDENTSKI": {"strictness": 1, "kindergarten_risk": "Low"},
+    "MLADOST": {"strictness": 3, "kindergarten_risk": "Moderate"},
+    "TRIADITSA": {"strictness": 4, "kindergarten_risk": "High"},
+    "KRUSTOVA VADA": {"strictness": 2, "kindergarten_risk": "Low"},
+}
+
+
+=========================================
 FILE: ./src/services/ai_engine.py
 =========================================
 import google.generativeai as genai
-import json
-import httpx
-import io
-from PIL import Image
-from typing import Dict, Any, List, Optional
-from src.core.config import settings
 from pydantic import BaseModel, Field
+from src.core.config import settings
 
-# --- PYDANTIC SCHEMA ---
 class AIAnalysisSchema(BaseModel):
-    address_prediction: str = Field(description="The deduced street address")
-    confidence: int = Field(ge=0, le=100, description="Confidence score 0-100")
-    reasoning_steps: List[str] = Field(description="Bullet points explaining the deduction")
-    neighborhood: str = Field(description="Inferred neighborhood")
-    is_atelier: bool = Field(description="True if property is legally an Atelier/Studio")
+    address_prediction: str = Field(description="Deduced address")
+    confidence: int = Field(description="Confidence score")
+    neighborhood: str = Field(description="Neighborhood name")
+    is_atelier: bool = Field(description="Is it an Atelier?")
+    net_living_area: float = Field(description="Extracted Net usable area in sq.m")
+    construction_stage: str = Field(description="Akt 14, 15, or 16")
+    construction_year: int = Field(description="Estimated or stated building finish year")
+    exposure: str = Field(description="Exposure like Sever, Yug, Iztok, Zapad")
 
 class GeminiService:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        
         if self.api_key != "mock-key":
             genai.configure(api_key=self.api_key)
             self.model_flash = genai.GenerativeModel('gemini-1.5-flash')
-            self.model_pro = genai.GenerativeModel('gemini-1.5-pro-vision')
         else:
             self.model_flash = None
-            self.model_pro = None
 
-    def _load_prompt(self, raw_text: str) -> str:
-        return f"""
-        Analyze this real estate listing text.
-        Extract the address, neighborhood, and verify if it is an Atelier.
-        LISTING TEXT:
-        {raw_text}
-        """
-
-    async def analyze_text(self, text: str) -> Dict[str, Any]:
+    async def analyze_text(self, text: str) -> dict:
         if not self.model_flash:
-            return {
-                "address_prediction": "Simulated Address", 
-                "confidence": 0, 
-                "reasoning_steps": ["Mock Mode"],
-                "is_atelier": False
-            }
-
-        try:
-            prompt = self._load_prompt(text)
-            response = self.model_flash.generate_content(
-                prompt,
-                generation_config={
-                    "response_mime_type": "application/json",
-                    "response_json_schema": AIAnalysisSchema.model_json_schema()
-                }
-            )
-            structured_data = AIAnalysisSchema.model_validate_json(response.text)
-            return structured_data.model_dump()
-
-        except Exception as e:
-            print(f"[AI ENGINE] Text Error: {e}")
-            return {"error": str(e), "confidence": 0}
-
-    async def analyze_images(self, image_urls: list[str]) -> Dict[str, Any]:
-        """
-        Downloads images and performs Visual Detective analysis.
-        """
-        if not self.model_pro:
-            return {"confidence": 0, "reasoning": "Vision Mock Mode"}
-
-        images_payload = []
+            return {"address_prediction": "Mock", "confidence": 0, "neighborhood": "Unknown", 
+                    "is_atelier": False, "net_living_area": 0, "construction_stage": "Unknown", 
+                    "construction_year": 2024, "exposure": "Unknown"}
         
-        # 1. Download images into memory
-        async with httpx.AsyncClient() as client:
-            for url in image_urls:
-                try:
-                    # Filter out empty or invalid URLs
-                    if not url or not url.startswith('http'): continue
-                    
-                    resp = await client.get(url, timeout=5.0)
-                    if resp.status_code == 200:
-                        img = Image.open(io.BytesIO(resp.content))
-                        images_payload.append(img)
-                except Exception as e:
-                    print(f"[AI VISION] Download failed for {url}: {e}")
-
-        if not images_payload:
-            return {"confidence": 0, "reasoning": "No valid images downloaded"}
-
-        # 2. Prompt Gemini Pro Vision
-        prompt = """
-        Act as a geospatial detective. Analyze these real estate photos.
-        1. Identify any unique landmarks (View from window).
-        2. Estimate building era based on facade/balcony style.
-        3. Look for street signs or shop names.
-        Return JSON with 'facade_era', 'landmarks_detected', and 'estimated_location_confidence'.
-        """
-        
-        try:
-            # Gemini Pro Vision handles list of [Prompt, Image, Image...]
-            response = self.model_pro.generate_content(
-                contents=[prompt, *images_payload],
-                generation_config={"response_mime_type": "application/json"}
-            )
-            return json.loads(response.text)
-        except Exception as e:
-            print(f"[AI VISION ERROR] {e}")
-            return {"confidence": 0, "error": str(e)}
+        prompt = f"Perform forensic analysis on this property ad and return JSON schema: {text}"
+        response = self.model_flash.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json", "response_json_schema": AIAnalysisSchema.model_json_schema()}
+        )
+        return AIAnalysisSchema.model_validate_json(response.text).model_dump()
 
 
 =========================================
 FILE: ./src/services/repository.py
 =========================================
 from sqlalchemy.orm import Session
-from src.db.models import Listing, Report, ReportStatus
+from src.db.models import Listing, Report, ReportStatus, PriceHistory
 from src.core.utils import normalize_url
-from typing import Optional
+from typing import Optional, List
 
 class RealEstateRepository:
     def __init__(self, db: Session):
         self.db = db
 
-    def create_listing(self, url: str, price: float, area: float, desc: str) -> Listing:
+    def create_listing_initial(self, url: str) -> Listing:
+        """Atomic create or return existing by URL."""
         clean_url = normalize_url(url)
-        # 1. URL Check (Fastest)
-        existing = self.get_listing_by_url(clean_url)
+        existing = self.db.query(Listing).filter(Listing.source_url == clean_url).first()
         if existing:
             return existing
             
-        new_listing = Listing(
-            source_url=clean_url,
-            price_bgn=price,
-            advertised_area_sqm=area,
-            description_raw=desc
-        )
+        new_listing = Listing(source_url=clean_url)
         self.db.add(new_listing)
         self.db.commit()
         self.db.refresh(new_listing)
         return new_listing
 
-    def get_listing_by_url(self, url: str) -> Optional[Listing]:
-        return self.db.query(Listing).filter(Listing.source_url == url).first()
-
-    def check_content_duplication(self, content_hash: str) -> Optional[int]:
-        """
-        Returns the ID of an existing listing if the content hash matches.
-        """
-        existing = self.db.query(Listing).filter(Listing.content_hash == content_hash).first()
-        return existing.id if existing else None
-
-    def update_listing_content(self, listing_id: int, description: str, content_hash: str):
+    def update_listing_data(self, listing_id: int, price: float, area: float, desc: str, chash: str):
         listing = self.db.query(Listing).get(listing_id)
         if listing:
-            listing.description_raw = description
-            listing.content_hash = content_hash
+            # Price History Logic
+            if listing.price_bgn and listing.price_bgn != price:
+                history = PriceHistory(listing_id=listing_id, price_bgn=listing.price_bgn)
+                self.db.add(history)
+            
+            listing.price_bgn = price
+            listing.advertised_area_sqm = area
+            listing.description_raw = desc
+            listing.content_hash = chash
             self.db.commit()
 
-    def create_report(self, listing_id: int, risk: int, details: dict, cost: float, confidence: int = 0) -> Report:
-        status = ReportStatus.VERIFIED if confidence >= 70 else ReportStatus.MANUAL_REVIEW
+    def create_report(self, listing_id: int, risk: int, details: dict, cost: float, confidence: int, images: List[str]) -> Report:
+        status = ReportStatus.VERIFIED if confidence >= 85 else ReportStatus.MANUAL_REVIEW
+        if risk > 60: status = ReportStatus.MANUAL_REVIEW # High risk always needs eyes
         
         report = Report(
             listing_id=listing_id,
@@ -560,11 +509,11 @@ class RealEstateRepository:
             ai_confidence_score=confidence,
             status=status,
             discrepancy_details=details,
-            cost_to_generate=cost
+            cost_to_generate=cost,
+            image_archive_urls=images
         )
         self.db.add(report)
         self.db.commit()
-        self.db.refresh(report)
         return report
 
 
@@ -721,48 +670,40 @@ class ScraperService:
 =========================================
 FILE: ./src/services/risk_engine.py
 =========================================
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 
 class RiskEngine:
-    def calculate_score(self, advertised_data: Dict, ai_insights: Dict, cadastre_area: Optional[float] = None) -> Dict[str, Any]:
+    def calculate_score(self, advertised: Dict, ai: Dict, cadastre_area: Optional[float] = None) -> Dict[str, Any]:
         score = 0
         flags = []
         
-        raw_text = advertised_data.get("raw_text", "").upper()
-        advertised_area = advertised_data.get("area", 0.0)
+        # 1. LEGAL / ATELIER
+        if ai.get("is_atelier", False):
+            score += 40
+            flags.append("LEGAL: Property registered as Atelier (non-residential). Potential loan issues.")
 
-        # 1. LEGAL STATUS (Atelier)
-        # Using the AI's structured output if available, else fallback to text
-        is_atelier = ai_insights.get("is_atelier", False)
-        if is_atelier or "АТЕЛИЕ" in raw_text or "ATELIER" in raw_text:
-            score += 30
-            flags.append("LEGAL_STATUS_RISK: Property is Atelier (Industrial/Non-residential status)")
+        # 2. AREA SQUEEZING
+        adv_area = advertised.get("area", 0)
+        if cadastre_area and adv_area > 0:
+            diff = (adv_area - cadastre_area) / cadastre_area
+            if diff > 0.20:
+                score += 30
+                flags.append(f"AREA: Advertised area is {diff:.1%} larger than Cadastre record.")
 
-        # 2. AREA MATH (Advertised vs Cadastre)
-        # The Gap fix: Check if advertised area is suspicious compared to official records
-        if cadastre_area and advertised_area > 0:
-            if advertised_area > (cadastre_area * 1.15): # 15% tolerance
-                score += 20
-                flags.append(f"AREA_DISCREPANCY: Advertised ({advertised_area}) > Cadastre ({cadastre_area})")
-
-        # 3. FLOOR RISKS
-        if "ПОСЛЕДЕН" in raw_text or "TOP FLOOR" in raw_text:
-            score += 15
-            flags.append("MAINTENANCE_RISK: Top floor")
-        
-        if "ПЪРВИ" in raw_text or "GROUND" in raw_text:
-            score += 10
-            flags.append("SECURITY_RISK: Ground floor")
-
-        # 4. PRICE ANOMALY
-        if advertised_data.get("price_predicted", 0) > 300000:
+        # 3. HEATING / UTILITIES (Sofia Specific)
+        vision = ai.get("vision_insights", {})
+        heating = vision.get("heating_source", "unknown").lower()
+        if "electricity" in heating or "air conditioning" in heating:
             score += 5
-            flags.append("FINANCIAL: High-ticket verification required")
+            flags.append("COST: Heating is electric (expected higher winter bills).")
+        
+        # 4. FLOOR POSITION
+        raw_text = advertised.get("raw_text", "").lower()
+        if any(x in raw_text for x in ["първи", "партер", "ground"]):
+            score += 15
+            flags.append("SECURITY: Ground floor unit.")
 
-        return {
-            "score": min(score, 100),
-            "flags": flags
-        }
+        return {"score": min(score, 100), "flags": flags}
 
 
 =========================================
@@ -823,6 +764,193 @@ class GeospatialService:
         
         # Real implementation will go here
         return {}
+
+
+=========================================
+FILE: ./src/services/base_provider.py
+=========================================
+from abc import ABC, abstractmethod
+from typing import Optional, Dict, Any
+
+class BaseRegistryProvider(ABC):
+    @abstractmethod
+    def fetch_details(self, address: str) -> Optional[Dict[str, Any]]:
+        """Fetch official property data from a government registry."""
+        pass
+
+class BaseGeoProvider(ABC):
+    @abstractmethod
+    def geocode(self, address: str) -> Dict[str, Any]:
+        """Convert address to GPS coordinates."""
+        pass
+
+
+=========================================
+FILE: ./src/services/storage_service.py
+=========================================
+import os
+import httpx
+from typing import List
+
+class StorageService:
+    """Handles archival of listing images to prevent data loss when ads disappear."""
+    def __init__(self, upload_dir="storage/archive"):
+        self.upload_dir = upload_dir
+        if not os.path.exists(upload_dir):
+            os.makedirs(upload_dir, exist_ok=True)
+
+    async def archive_images(self, listing_id: int, urls: List[str]) -> List[str]:
+        archived_paths = []
+        async with httpx.AsyncClient() as client:
+            for i, url in enumerate(urls):
+                try:
+                    resp = await client.get(url, timeout=5.0)
+                    if resp.status_code == 200:
+                        filename = f"listing_{listing_id}_{i}.jpg"
+                        path = os.path.join(self.upload_dir, filename)
+                        with open(path, "wb") as f:
+                            f.write(resp.content)
+                        archived_paths.append(path)
+                except Exception as e:
+                    print(f"Archive fail: {e}")
+        return archived_paths
+
+
+=========================================
+FILE: ./src/services/legal_engine.py
+=========================================
+from src.core.sofia_data import SOFIA_ADMIN_MAP
+from datetime import datetime
+
+class LegalEngine:
+    """
+    Translates Bulgarian Property Law into code-based risk metrics.
+    """
+    def analyze_listing(self, scraped_data: dict, ai_data: dict):
+        risk_report = {
+            "total_legal_score": 0,
+            "pillars": {},
+            "gatekeeper_verdict": "CLEAR",
+            "flags": []
+        }
+
+        raw_text = scraped_data.get("raw_text", "").upper()
+        rayon = ai_data.get("neighborhood", "Unknown").upper()
+
+        # Pillar I: Statutory Classification (The Atelier Trap)
+        p1_score = 0
+        if ai_data.get("is_atelier") or "АТЕЛИЕ" in raw_text or "ATELIER" in raw_text:
+            p1_score += 35 
+            if any(x in raw_text for x in ["СЕВЕР", "NORTH"]):
+                p1_score += 15
+                risk_report["flags"].append("INSOLENCE_FAILURE: North-facing Atelier cannot legally be an apartment.")
+            
+            admin_data = SOFIA_ADMIN_MAP.get(rayon, {"strictness": 3})
+            if admin_data["strictness"] >= 4:
+                p1_score += 20
+                risk_report["flags"].append(f"ADDRESS_REG_RISK: District {rayon} is notoriously strict for Atelier owners.")
+
+        risk_report["pillars"]["classification"] = p1_score
+
+        # Pillar II: Construction Purgatory (The 'Akt' Matrix)
+        p2_score = 0
+        current_year = datetime.now().year
+        if "АКТ 15" in raw_text or "ACT 15" in raw_text:
+            build_year = ai_data.get("construction_year")
+            if build_year and (current_year - build_year) > 2:
+                p2_score += 45
+                risk_report["flags"].append("ETERNAL_AKT_15: Building lacks Akt 16 for over 24 months.")
+        risk_report["pillars"]["construction"] = p2_score
+
+        # Pillar III: Area Value Integrity (Common Parts Ratio)
+        p3_score = 0
+        total_area = scraped_data.get("area", 0)
+        net_area = ai_data.get("net_living_area", 0)
+        if total_area > 0 and net_area > 0:
+            ratio = (total_area - net_area) / total_area
+            if ratio > 0.25:
+                p3_score += 40
+                risk_report["flags"].append(f"PREDATORY_COMMON_PARTS: {ratio:.1%} is non-living space.")
+        risk_report["pillars"]["area_value"] = p3_score
+
+        # Pillar IV: High-Yield Legal Encumbrances (Toxicity Rank)
+        toxicity_score = 0
+        if any(x in raw_text for x in ["ПОЛЗВАНЕ", "ПОЖИЗНЕНО", "USER RIGHT"]):
+            toxicity_score = 100
+            risk_report["gatekeeper_verdict"] = "ABORT"
+            risk_report["flags"].append("FATAL: RIGHT OF USE (Nude Ownership).")
+        
+        if any(x in raw_text for x in ["ИСКОВА МОЛБА", "СЪДЕБЕН", "LITIGATION", "CLAIM"]):
+            toxicity_score = max(toxicity_score, 95)
+            risk_report["gatekeeper_verdict"] = "ABORT"
+            risk_report["flags"].append("FATAL: PENDING LITIGATION (Iskova Molba).")
+
+        if any(x in raw_text for x in ["ВЪЗБРАНА", "ЧСИ", "НАП", "DISTRAINT"]):
+            toxicity_score = max(toxicity_score, 90)
+            risk_report["flags"].append("CRITICAL: DISTRAINT (Asset Frozen for Debt).")
+
+        risk_report["pillars"]["toxicity"] = toxicity_score
+        risk_report["total_legal_score"] = max(p1_score, p2_score, p3_score, toxicity_score)
+        
+        return risk_report
+
+
+=========================================
+FILE: ./src/services/report_generator.py
+=========================================
+class AttorneyReportGenerator:
+    """
+    Transforms quantitative risk data into a senior legal brief.
+    """
+    def generate_legal_brief(self, listing_data: dict, legal_analysis: dict, ai_data: dict) -> str:
+        verdict = legal_analysis.get("gatekeeper_verdict", "CLEAR")
+        score = legal_analysis.get("total_legal_score", 0)
+        
+        status_symbol = "🟢 CLEAR"
+        if verdict == "ABORT": status_symbol = "🔴 FATAL LEGAL STATUS"
+        elif score > 60: status_symbol = "🟠 HIGH-FRICTION ASSET"
+        elif score > 30: status_symbol = "🟡 CAUTION REQUIRED"
+
+        sections = [
+            f"# {status_symbol}",
+            "## Executive Jurisprudential Summary",
+            self._summary(legal_analysis),
+            "\n## I. Statutory Classification & Utilities",
+            self._classification_text(ai_data),
+            "\n## II. Construction Stage Maturity",
+            self._construction_text(legal_analysis),
+            "\n## III. Economic Yield vs Area Integrity",
+            self._area_text(listing_data, ai_data),
+            "\n## IV. Legal Toxicity Flags",
+            "\n".join([f"- {f}" for f in legal_analysis["flags"]]) if legal_analysis["flags"] else "No public-facing red flags detected."
+        ]
+        return "\n".join(sections)
+
+    def _summary(self, analysis):
+        if analysis["gatekeeper_verdict"] == "ABORT":
+            return "Critical title defects detected. Any transfer would be legally precarious. Recommendation: CEASE TRANSACTION."
+        if analysis["total_legal_score"] > 50:
+            return "This asset exhibits significant administrative friction and financial opacity."
+        return "The asset appears to align with standard Sofia residential norms."
+
+    def _classification_text(self, ai):
+        if not ai.get("is_atelier"): return "Object is legally a Dwelling (Жилище)."
+        return f"**WARNING:** Atelier Status in {ai.get('neighborhood')}. Expect kindergarten and ID registration friction."
+
+    def _construction_text(self, analysis):
+        if analysis["pillars"].get("construction", 0) > 40:
+            return "Building shows evidence of 'Eternal Akt 15'. Potential legal/structural non-compliance detected."
+        return "Normal administrative progression observed."
+
+    def _area_text(self, listing, ai):
+        total = listing.get("area", 0)
+        net = ai.get("net_living_area", 0)
+        if total > 0 and net > 0:
+            ratio = (total - net) / total
+            if ratio > 0.23: 
+                real_p = (listing.get("price_bgn", 0) / net) if net > 0 else 0
+                return f"PREDATORY INFLATION: {ratio:.1%} common parts. Adjusted Price: {real_p:.0f} BGN/sq.m (Net)."
+        return "Standard area efficiency ratios detected."
 
 
 =========================================
@@ -909,54 +1037,59 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from src.db.session import Base
 
-class ReportStatus(set, enum.Enum):
+class ReportStatus(str, enum.Enum):
     PENDING = "PENDING"
     PROCESSING = "PROCESSING"
     VERIFIED = "VERIFIED"
     MANUAL_REVIEW = "MANUAL_REVIEW"
     REJECTED = "REJECTED"
 
-class Building(Base):
-    __tablename__ = "buildings"
-
-    id = Column(Integer, primary_key=True, index=True)
-    cadastre_id = Column(String, unique=True, nullable=False, index=True)
-    address_street = Column(String)
-    address_number = Column(String)
-    neighborhood = Column(String)
-    gps_coordinates = Column(String) 
-    construction_year = Column(Integer)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    reports = relationship("Report", back_populates="building")
-
 class Listing(Base):
     __tablename__ = "listings"
 
     id = Column(Integer, primary_key=True, index=True)
     source_url = Column(String, unique=True, nullable=False, index=True)
-    content_hash = Column(String(64), index=True) # For idempotency
+    content_hash = Column(String(64), index=True)
     price_bgn = Column(Float)
     advertised_area_sqm = Column(Float)
     description_raw = Column(Text)
     scraped_at = Column(DateTime(timezone=True), server_default=func.now())
 
     reports = relationship("Report", back_populates="listing")
+    price_history = relationship("PriceHistory", back_populates="listing")
+
+class PriceHistory(Base):
+    __tablename__ = "price_history"
+    id = Column(Integer, primary_key=True)
+    listing_id = Column(Integer, ForeignKey("listings.id"))
+    price_bgn = Column(Float)
+    changed_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    listing = relationship("Listing", back_populates="price_history")
+
+class Building(Base):
+    __tablename__ = "buildings"
+    id = Column(Integer, primary_key=True)
+    cadastre_id = Column(String, unique=True, index=True)
+    address_full = Column(String)
+    latitude = Column(Float)
+    longitude = Column(Float)
+    construction_year = Column(Integer)
+    
+    reports = relationship("Report", back_populates="building")
 
 class Report(Base):
     __tablename__ = "reports"
-
     id = Column(Integer, primary_key=True, index=True)
     listing_id = Column(Integer, ForeignKey("listings.id"))
     building_id = Column(Integer, ForeignKey("buildings.id"), nullable=True)
     
     status = Column(Enum(ReportStatus), default=ReportStatus.PENDING)
-    risk_score = Column(Integer)  # 0-100
+    risk_score = Column(Integer)
     ai_confidence_score = Column(Integer, default=0)
     
-    is_address_verified = Column(Boolean, default=False)
     discrepancy_details = Column(JSON)
-    manual_review_notes = Column(Text)
+    image_archive_urls = Column(JSON) # Store URLs of backed-up images
     cost_to_generate = Column(Float)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -995,110 +1128,56 @@ FILE: ./src/tasks.py
 from src.worker import celery_app
 from src.db.session import SessionLocal
 from src.db.models import Listing, Report, ReportStatus
-from src.services.repository import RealEstateRepository
 from src.services.scraper_service import ScraperService
 from src.services.ai_engine import GeminiService
-from src.services.risk_engine import RiskEngine
-from src.services.cadastre_service import CadastreService
-from src.services.geospatial_service import GeospatialService
+from src.services.legal_engine import LegalEngine
+from src.services.report_generator import AttorneyReportGenerator
 from src.core.config import settings
-from src.core.utils import calculate_content_hash, normalize_address
 import asyncio
 
 @celery_app.task(name="src.tasks.audit_listing")
 def audit_listing_task(listing_id: int):
     db = SessionLocal()
     try:
-        repo = RealEstateRepository(db)
-        
-        # Initialize Services
         scraper = ScraperService(simulation_mode=(settings.GEMINI_API_KEY == "mock-key"))
         ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
-        risk_engine = RiskEngine()
-        cadastre_service = CadastreService()
-        geo_service = GeospatialService() # Ready for future use
+        legal_engine = LegalEngine()
+        brief_gen = AttorneyReportGenerator()
 
         listing = db.query(Listing).get(listing_id)
         if not listing: return "Listing not found"
 
-        # 1. SCRAPE
-        print(f"[TASK] Scraping listing {listing_id}...")
+        # 1. Scraping
         scraped_data = scraper.scrape_url(listing.source_url)
-            
-        # 2. IDEMPOTENCY
-        current_hash = calculate_content_hash(scraped_data["raw_text"], listing.price_bgn or 0)
-        duplicate_id = repo.check_content_duplication(current_hash)
-        if duplicate_id and duplicate_id != listing.id:
-            repo.update_listing_content(listing.id, scraped_data["raw_text"], current_hash)
-            return "Aborted: Duplicate Content"
-        repo.update_listing_content(listing.id, scraped_data["raw_text"], current_hash)
-
-        # 3. AI ANALYSIS (Async in Sync Worker)
+        
+        # 2. Tier 1 AI Forensic Analysis
         loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-        print(f"[TASK] Running AI Tier 1...")
-        tier1_result = loop.run_until_complete(ai_engine.analyze_text(scraped_data["raw_text"]))
-        
-        # 4. EXTERNAL DATA (Cadastre)
-        address_found = tier1_result.get("address_prediction", "")
-        clean_address = normalize_address(address_found)
-        cadastre_data = cadastre_service.fetch_details(clean_address)
-        
-        official_area = cadastre_data.get("official_area") if cadastre_data else None
+        ai_data = loop.run_until_complete(ai_engine.analyze_text(scraped_data["raw_text"]))
 
-        # 5. TIER 2 VISION (Conditional)
-        confidence = tier1_result.get("confidence", 0)
-        final_ai_data = tier1_result
-        total_cost = 0.04
+        # 3. Apply Professional Legal Logic
+        legal_results = legal_engine.analyze_listing(scraped_data, ai_data)
+        legal_brief = brief_gen.generate_legal_brief(scraped_data, legal_results, ai_data)
 
-        # Trigger Vision if confidence is low OR if it looks like an Atelier
-        if (confidence < 80 or final_ai_data.get("is_atelier")) and settings.GEMINI_API_KEY != "mock-key":
-            print(f"[TASK] Escalating to Tier 2 Vision...")
-            tier2_result = loop.run_until_complete(ai_engine.analyze_images(scraped_data["image_urls"]))
-            final_ai_data["vision_insights"] = tier2_result
-            total_cost += 0.22
-            # Boost confidence if vision found landmarks
-            if tier2_result.get("estimated_location_confidence", 0) > 50:
-                confidence = max(confidence, 85)
+        # 4. Status Determination (The "Kill Switch")
+        status = ReportStatus.VERIFIED if legal_results["total_legal_score"] < 40 else ReportStatus.MANUAL_REVIEW
+        if legal_results["gatekeeper_verdict"] == "ABORT":
+            status = ReportStatus.REJECTED
 
-        # 6. RISK CALCULATION
-        report_data = risk_engine.calculate_score(
-            scraped_data, 
-            final_ai_data, 
-            cadastre_area=official_area
-        )
-        
-        repo.create_report(
+        # 5. Commit Audit Report
+        report = Report(
             listing_id=listing.id,
-            risk=report_data["score"],
-            details={"flags": report_data["flags"], "ai_meta": final_ai_data, "cadastre_match": bool(cadastre_data)},
-            cost=total_cost,
-            confidence=confidence
+            status=status,
+            risk_score=legal_results["total_legal_score"],
+            ai_confidence_score=ai_data["confidence"],
+            manual_review_notes=legal_brief,
+            discrepancy_details=legal_results
         )
-        return "Audit Complete"
+        db.add(report)
+        db.commit()
+        return f"Audit Complete: Verdict {status}"
 
     except Exception as e:
         print(f"[TASK_ERROR] {str(e)}")
-        # FAIL-SAFE: Update DB to REJECTED so UI doesn't hang
-        try:
-            # Re-connect in case main session is dead
-            error_db = SessionLocal()
-            error_report = error_db.query(Report).filter(Report.listing_id == listing_id).first()
-            if not error_report:
-                error_report = Report(listing_id=listing_id, status=ReportStatus.REJECTED)
-                error_db.add(error_report)
-            else:
-                error_report.status = ReportStatus.REJECTED
-            
-            error_report.manual_review_notes = f"System Error: {str(e)}"
-            error_db.commit()
-            error_db.close()
-        except Exception as db_e:
-            print(f"[CRITICAL DB ERROR] {db_e}")
-            
         return f"Failed: {str(e)}"
     finally:
         db.close()
@@ -1139,29 +1218,26 @@ echo "Dump complete. Copy contents of $output"
 =========================================
 FILE: ./prompts/detective_prompt_v1.md
 =========================================
-# Role: Geospatial Detective
-You are an expert Investigator. Your task is to identify the specific building address of a real estate listing based on limited metadata and photos.
+# Role: Geospatial & Technical Detective
+Analyze the real estate listing. Focus on detecting hidden legal or maintenance risks.
 
-## Input Data
-- **Listing Text:** {text_raw}
-- **Images:** {image_list}
-- **Neighborhood Hint:** {neighborhood}
-
-## Logic Constraints
-1. **Fact vs Guess:** Distinguish between explicitly stated streets and visual deductions.
-2. **The "Red House" Rule:** Look for unique landmarks in the "View from Window" photos.
-3. **Facade Matching:** Describe the balcony curve/color and estimate construction era.
+## Constraints
+1. **Atelier Check:** Look for "Atelier" in text or industrial/office elements in photos.
+2. **Heating:** Identify AC units, radiators, or fireplace.
+3. **Era:** Estimate if building is Pre-1989 (Panel/EPC) or Post-2000 (Brick).
+4. **Landmarks:** Identify specific street names or shop signs.
 
 ## Output Format (JSON Only)
 {
   "address_prediction": "String",
   "confidence": 0-100,
-  "reasoning_steps": [
-    "Identified beige facade matching 2003 construction style.",
-    "Located restaurant 'Chefs' on ground floor visible in photo 3.",
-    "Triangulated address to Ul. Lyubata 13."
-  ],
-  "unit_type_discrepancy": "Apartment vs Atelier" (if applicable)
+  "is_atelier": boolean,
+  "reasoning_steps": ["Step 1", "Step 2"],
+  "vision_insights": {
+    "facade_era": "string",
+    "heating_source": "electricity/gas/central",
+    "floor_plan_suspicion": "high/low"
+  }
 }
 
 
