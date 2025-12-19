@@ -17,9 +17,12 @@ class Listing(Base):
     source_url = Column(String, unique=True, nullable=False, index=True)
     content_hash = Column(String(64), index=True)
     
-    # FINANCIAL FIX: Use Numeric for precise currency handling
+    # Financial Precision
     price_bgn = Column(Numeric(12, 2)) 
-    advertised_area_sqm = Column(Float)
+    
+    # Area Precision (Fixed from Float)
+    advertised_area_sqm = Column(Numeric(10, 2))
+    
     description_raw = Column(Text)
     scraped_at = Column(DateTime(timezone=True), server_default=func.now())
     
@@ -56,7 +59,6 @@ class Report(Base):
     discrepancy_details = Column(JSON)
     image_archive_urls = Column(JSON)
     
-    # COST FIX: Track API usage precisely
     cost_to_generate = Column(Numeric(10, 4)) 
     
     manual_review_notes = Column(Text, nullable=True)

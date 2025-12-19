@@ -1,7 +1,8 @@
+from asgiref.sync import async_to_sync
 from src.worker import celery_app
 from src.db.session import SessionLocal
 from src.db.models import Listing, Report, ReportStatus
-from src.services.scraper_service import ScraperService, WAFBlockError
+from src.services.scraper_service import ScraperService
 from src.services.ai_engine import GeminiService
 from src.services.legal_engine import LegalEngine
 from src.services.report_generator import AttorneyReportGenerator
@@ -18,19 +19,12 @@ from src.core.logger import logger
 import asyncio
 import httpx
 
-def run_async(coroutine):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coroutine)
-    finally:
-        loop.close()
-
 @celery_app.task(name="src.tasks.audit_listing", bind=True, 
-                 autoretry_for=(WAFBlockError, httpx.ConnectError), 
-                 retry_backoff=True, max_retries=5)
+                 autoretry_for=(Exception,), 
+                 retry_backoff=True, max_retries=3)
 def audit_listing_task(self, listing_id: int):
-    return run_async(run_audit_pipeline(listing_id))
+    """Bridge sync Celery worker to async pipeline safely."""
+    return async_to_sync(run_audit_pipeline)(listing_id)
 
 async def run_audit_pipeline(listing_id: int):
     log = logger.bind(listing_id=listing_id)
@@ -59,10 +53,8 @@ async def run_audit_pipeline(listing_id: int):
                 # 2. Scrape
                 scraped_data: ScrapedListing = await scraper.scrape_url(listing.source_url)
                 
-                # 3. IDEMPOTENCY CHECK (Save Money)
-                # Note: Schema ensures price_predicted is Decimal, so we convert to float only for hashing if needed
+                # 3. Idempotency
                 current_hash = calculate_content_hash(scraped_data.raw_text, float(scraped_data.price_predicted))
-                
                 if listing.content_hash == current_hash and listing.reports:
                     log.info("audit_skipped_unchanged")
                     return "Audit Skipped: Content Unchanged"
@@ -84,10 +76,10 @@ async def run_audit_pipeline(listing_id: int):
                 comp_data = RegistryCheck(**comp_raw)
                 risk_data = RegistryCheck(**risk_raw)
 
-                # 6. Update Listing Meta (Using Decimal directly)
+                # 6. Update Listing Meta
                 repo.update_listing_data(
                     listing_id, 
-                    scraped_data.price_predicted, # CORRECT: Passing Decimal
+                    scraped_data.price_predicted,
                     scraped_data.area_sqm, 
                     scraped_data.raw_text, 
                     current_hash

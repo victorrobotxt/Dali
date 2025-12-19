@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Fri Dec 19 20:19:24 EET 2025
+Fri Dec 19 20:28:21 EET 2025
 
 
 --- GIT HISTORY ---
-* d13df83 (HEAD -> main) refactor(core): harden security, async concurrency, and financial precision
+* 0f7d54d (HEAD -> main) refactor(core): production hardening, type safety, and architecture cleanup
+* d13df83 refactor(core): harden security, async concurrency, and financial precision
 * 5a71d4d refactor(core): promote prototype to production-ready architecture
 * fdd6519 docs: update architecture, API contract, and debt log to match V1 state
 * a107438 feat(core): implement forensic analysis and anti-manipulation logic
@@ -22,7 +23,6 @@ Fri Dec 19 20:19:24 EET 2025
 * b7f3797 refactor(core): migrate to Redis/Celery queue and add Alembic migrations
 * f22a7da feat(core): implement AI engine, workflow logic, and docs
 * e847d18 feat(backend): complete ORM models, repo pattern, and test suite
-* d266a4d ops: add docker containerization and orchestration
 
 
 --- FILE STRUCTURE ---
@@ -45,12 +45,10 @@ Fri Dec 19 20:19:24 EET 2025
 │   ├── LASTENHEFT_DE.md
 │   ├── TECHNICAL_DEBT.md
 │   └── api_contract.yaml
-├── forensic_check.py
 ├── forensics
 │   ├── headers.txt
 │   └── page_utf8.html
 ├── forensics_dump.html
-├── forensics_engine.py
 ├── glashaus_context.txt
 ├── imot_simulation.html
 ├── manual_session_audit.py
@@ -59,7 +57,6 @@ Fri Dec 19 20:19:24 EET 2025
 ├── prompts
 │   └── detective_prompt_v1.md
 ├── requirements.txt
-├── risk_engine.py
 ├── scraper_service.py
 ├── scripts
 │   └── context_dump.sh
@@ -70,6 +67,7 @@ Fri Dec 19 20:19:24 EET 2025
 │   ├── core
 │   │   ├── config.py
 │   │   ├── logger.py
+│   │   ├── patterns.py
 │   │   ├── sofia_data.py
 │   │   └── utils.py
 │   ├── db
@@ -101,7 +99,7 @@ Fri Dec 19 20:19:24 EET 2025
 │   └── test_api.py
 └── waf_challenge.html
 
-18 directories, 56 files
+18 directories, 54 files
 
 
 --- FILE CONTENTS ---
@@ -395,14 +393,14 @@ FILE: ./src/core/config.py
 =========================================
 import os
 from pydantic_settings import BaseSettings
-from pydantic import Field, field_validator
+from pydantic import Field
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Glashaus"
     VERSION: str = "1.0.0-PROD"
     ENV: str = Field("DEV", description="DEV or PROD")
     
-    # SECURITY: No defaults allowed. App must crash if these are missing.
+    # SECURITY FIX: No default value. Fails safely if missing.
     GEMINI_API_KEY: str = Field(..., min_length=10, description="Must be set in .env")
     
     # Database
@@ -489,6 +487,45 @@ logger = structlog.get_logger()
 
 
 =========================================
+FILE: ./src/core/patterns.py
+=========================================
+import re
+
+class ForensicPatterns:
+    # VAT Trap: "Price excludes VAT" or "No VAT charged"
+    VAT_EXCLUDED = re.compile(r"(?i)(цената е без ддс|без ддс|vat excluded|no vat|не се начислява ддс)")
+    
+    # Broker Filter: "Private individuals only", "No agencies"
+    PRIVATE_ONLY = re.compile(r"(?i)(само за частни лица|частни лица|без агенции|колеги не)")
+    
+    # Space Hack: "Converted studio", "Kitchen in corridor", "Small size"
+    SPACE_HACK = re.compile(r"(?i)(преустроена? гарсониера|усвоен.*?балкон|кухня.*?коридор|бивша.*?кухня|маломерен|боксониера)")
+    
+    # Legal Status: "Atelier", "Studio"
+    ATELIER_STATUTE = re.compile(r"(?i)(статут.*?ателие|статут на ателие|студио|творческо ателие)")
+    
+    # Floor Risks: "Ground floor", "Basement"
+    GROUND_FLOOR = re.compile(r"(?i)(партер|етаж 1 от|висок партер|кота 0|сутерен)")
+    
+    # Liquidity Trap: "Act 16 in 2028" (Future years)
+    FUTURE_COMPLETION = re.compile(r"(?i)(\d{1,2}%.*?сега|\d{1,2}%.*?предварителен|\d{1,2}%.*?акт 16)")
+
+    @staticmethod
+    def extract_flags(text: str) -> list[str]:
+        flags = []
+        if not text: return flags
+        
+        if ForensicPatterns.VAT_EXCLUDED.search(text):
+            flags.append("VAT_EXCLUDED")
+        if ForensicPatterns.SPACE_HACK.search(text):
+            flags.append("CONVERSION_RISK")
+        if ForensicPatterns.GROUND_FLOOR.search(text):
+            flags.append("GROUND_FLOOR_RISK")
+            
+        return flags
+
+
+=========================================
 FILE: ./src/services/ai_engine.py
 =========================================
 import google.generativeai as genai
@@ -526,9 +563,9 @@ class GeminiService:
 =========================================
 FILE: ./src/services/repository.py
 =========================================
-from sqlalchemy.dialects.postgresql import insert
+from decimal import Decimal
 from sqlalchemy.orm import Session
-from src.db.models import Listing, Report, PriceHistory
+from src.db.models import Listing, PriceHistory
 from src.core.utils import normalize_url
 
 class RealEstateRepository:
@@ -545,12 +582,15 @@ class RealEstateRepository:
         self.db.refresh(new_l)
         return new_l
 
-    def update_listing_data(self, listing_id: int, price: float, area: float, desc: str, chash: str):
+    # TYPE SAFETY FIX: price is now Decimal
+    def update_listing_data(self, listing_id: int, price: Decimal, area: float, desc: str, chash: str):
         listing = self.db.query(Listing).get(listing_id)
         if listing:
-            if listing.price_bgn and listing.price_bgn != price:
+            # SQLAlchemy handles Decimal comparison correctly here
+            if listing.price_bgn is not None and listing.price_bgn != price:
                 history = PriceHistory(listing_id=listing_id, price_bgn=listing.price_bgn)
                 self.db.add(history)
+            
             listing.price_bgn = price
             listing.advertised_area_sqm = area
             listing.description_raw = desc
@@ -628,6 +668,10 @@ from bs4 import BeautifulSoup
 from src.schemas import ScrapedListing
 from src.core.logger import logger
 
+# CUSTOM EXCEPTIONS
+class WAFBlockError(Exception): pass
+class ParsingError(Exception): pass
+
 class ScraperService:
     def __init__(self, client: httpx.AsyncClient, simulation_mode=False):
         self.client = client
@@ -638,7 +682,6 @@ class ScraperService:
         }
 
     async def _parse_html(self, content: str, url: str) -> ScrapedListing:
-        """CPU-bound parsing logic run in thread."""
         soup = BeautifulSoup(content, 'html.parser')
         text = soup.get_text(" ", strip=True)
 
@@ -648,7 +691,6 @@ class ScraperService:
         
         if p_match:
             try:
-                # Remove spaces, ensure standard decimal format
                 clean_str = re.sub(r'[^\d]', '', p_match.group(1))
                 price_decimal = Decimal(clean_str)
             except InvalidOperation:
@@ -674,19 +716,19 @@ class ScraperService:
         
         try:
             resp = await self.client.get(clean_url, headers=self.headers, follow_redirects=True)
-            # Handle Windows-1251 encoding common in BG sites
             content = resp.content.decode('windows-1251', errors='ignore')
             
-            if "captcha" in content.lower():
+            # WAF DETECTION
+            if any(x in content.lower() for x in ["captcha", "security check", "verify you are human"]):
                 log.error("waf_block_detected")
-                raise ConnectionError("WAF_BLOCK: Captcha triggered")
+                raise WAFBlockError("CAPTCHA Triggered: Rotation Required")
 
-            # CRITICAL: Offload CPU-bound parsing to prevent blocking the Event Loop
             result = await asyncio.to_thread(self._parse_html, content, clean_url)
-            
             log.info("scrape_success", price=str(result.price_predicted), area=result.area_sqm)
             return result
             
+        except WAFBlockError as we:
+            raise we
         except Exception as e:
             log.error("scrape_failed", error=str(e))
             raise e
@@ -901,12 +943,10 @@ class StorageService:
 FILE: ./src/services/legal_engine.py
 =========================================
 from src.core.sofia_data import SOFIA_ADMIN_MAP
+from src.core.patterns import ForensicPatterns  # Import the new patterns
 from datetime import datetime
 
 class LegalEngine:
-    """
-    Translates Bulgarian Property Law into code-based risk metrics.
-    """
     def analyze_listing(self, scraped_data: dict, ai_data: dict):
         risk_report = {
             "total_legal_score": 0,
@@ -916,7 +956,17 @@ class LegalEngine:
         }
 
         raw_text = scraped_data.get("raw_text", "").upper()
-        rayon = ai_data.get("neighborhood", "Unknown").upper()
+        
+        # 0. REGEX FORENSICS (New Layer)
+        regex_flags = ForensicPatterns.extract_flags(raw_text)
+        risk_report["flags"].extend(regex_flags)
+        
+        # Apply score penalties for regex flags
+        if "VAT_EXCLUDED" in regex_flags:
+            risk_report["flags"].append("FINANCIAL: Advertised price is likely 20% higher (+VAT).")
+        if "CONVERSION_RISK" in regex_flags:
+             risk_report["total_legal_score"] += 30
+             risk_report["flags"].append("PHYSICAL: High risk of 'Space Hack' (Garage/Corridor conversion).")
 
         # Pillar I: Statutory Classification (The Atelier Trap)
         p1_score = 0
@@ -926,6 +976,7 @@ class LegalEngine:
                 p1_score += 15
                 risk_report["flags"].append("INSOLENCE_FAILURE: North-facing Atelier cannot legally be an apartment.")
             
+            rayon = ai_data.get("neighborhood", "Unknown").upper()
             admin_data = SOFIA_ADMIN_MAP.get(rayon, {"strictness": 3})
             if admin_data["strictness"] >= 4:
                 p1_score += 20
@@ -1204,32 +1255,51 @@ FILE: ./src/services/forensics_service.py
 import httpx
 import uuid
 import time
+from src.core.logger import logger
 
 class SofiaMunicipalForensics:
     """Check Act 16 and Construction Permits at nag.sofia.bg."""
-    def __init__(self):
+    def __init__(self, client: httpx.AsyncClient = None):
         self.headers = {'User-Agent': 'Mozilla/5.0', 'X-Requested-With': 'XMLHttpRequest'}
+        self.client = client
 
     async def run_compliance_check(self, cadastre_id: str) -> dict:
         if not cadastre_id: return {"has_act16": False, "permits": 0}
-        async with httpx.AsyncClient(headers=self.headers, verify=False, timeout=15.0) as client:
-            return {
-                "act16": await self._check_act16(client, cadastre_id),
-                "permits": await self._check_permits(client, cadastre_id)
-            }
+        
+        # Use injected client if available (efficient) or new safe client
+        if self.client:
+            return await self._execute_check(self.client, cadastre_id)
+            
+        async with httpx.AsyncClient(headers=self.headers, timeout=15.0) as client:
+            return await self._execute_check(client, cadastre_id)
+
+    async def _execute_check(self, client, cadastre_id):
+        return {
+            "act16": await self._check_act16(client, cadastre_id),
+            "permits": await self._check_permits(client, cadastre_id)
+        }
 
     async def _check_act16(self, client, cid):
-        await client.get("https://nag.sofia.bg/RegisterCertificateForExploitationBuildings/Search", 
-                         params={'searchQueryId': str(uuid.uuid4()), 'Identifier': cid})
-        res = await client.post("https://nag.sofia.bg/RegisterCertificateForExploitationBuildings/Read", data={'page': '1', 'pageSize': '10'})
-        return len(res.json().get("Data", [])) > 0
+        try:
+            await client.get("https://nag.sofia.bg/RegisterCertificateForExploitationBuildings/Search", 
+                            params={'searchQueryId': str(uuid.uuid4()), 'Identifier': cid})
+            res = await client.post("https://nag.sofia.bg/RegisterCertificateForExploitationBuildings/Read", 
+                                  data={'page': '1', 'pageSize': '10'})
+            return len(res.json().get("Data", [])) > 0
+        except Exception as e:
+            logger.error("forensics_act16_fail", error=str(e))
+            return False
 
     async def _check_permits(self, client, cid):
-        await client.get("https://nag.sofia.bg/RegisterBuildingPermitsPortal")
-        await client.get("https://nag.sofia.bg/RegisterBuildingPermitsPortal/Search", 
-                         params={'searchQueryId': str(uuid.uuid4()), 'Identifier': cid, '_': int(time.time()*1000)})
-        res = await client.post("https://nag.sofia.bg/RegisterBuildingPermitsPortal/Read", data={'page': 1, 'pageSize': 10})
-        return res.json().get("Total", 0)
+        try:
+            # Emulate browser navigation to set cookies/session
+            await client.get("https://nag.sofia.bg/RegisterBuildingPermitsPortal")
+            await client.get("https://nag.sofia.bg/RegisterBuildingPermitsPortal/Search", 
+                            params={'searchQueryId': str(uuid.uuid4()), 'Identifier': cid, '_': int(time.time()*1000)})
+            res = await client.post("https://nag.sofia.bg/RegisterBuildingPermitsPortal/Read", data={'page': 1, 'pageSize': 10})
+            return res.json().get("Total", 0)
+        except Exception:
+            return 0
 
 
 =========================================
@@ -1408,7 +1478,7 @@ FILE: ./src/tasks.py
 from src.worker import celery_app
 from src.db.session import SessionLocal
 from src.db.models import Listing, Report, ReportStatus
-from src.services.scraper_service import ScraperService
+from src.services.scraper_service import ScraperService, WAFBlockError
 from src.services.ai_engine import GeminiService
 from src.services.legal_engine import LegalEngine
 from src.services.report_generator import AttorneyReportGenerator
@@ -1433,7 +1503,9 @@ def run_async(coroutine):
     finally:
         loop.close()
 
-@celery_app.task(name="src.tasks.audit_listing", bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
+@celery_app.task(name="src.tasks.audit_listing", bind=True, 
+                 autoretry_for=(WAFBlockError, httpx.ConnectError), 
+                 retry_backoff=True, max_retries=5)
 def audit_listing_task(self, listing_id: int):
     return run_async(run_audit_pipeline(listing_id))
 
@@ -1441,17 +1513,14 @@ async def run_audit_pipeline(listing_id: int):
     log = logger.bind(listing_id=listing_id)
     log.info("audit_started")
 
-    # Shared Session for Scraper + Cadastre + Compliance + CityRisk
-    # 30s timeout, Standard SSL verification enabled
     async with httpx.AsyncClient(timeout=30.0) as http_client:
         with SessionLocal() as db:
             try:
-                # 1. Initialize Services (Injecting Shared Client)
+                # 1. Init Services
                 repo = RealEstateRepository(db)
                 scraper = ScraperService(client=http_client, simulation_mode=(settings.GEMINI_API_KEY == "mock-key"))
                 ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
                 
-                # All Registry Services now share the TCP connection pool
                 cadastre = CadastreService(client=http_client)
                 compliance = ComplianceService(client=http_client)
                 city_risk = CityRiskService(client=http_client)
@@ -1462,27 +1531,29 @@ async def run_audit_pipeline(listing_id: int):
                 risk_engine = RiskEngine()
 
                 listing = db.query(Listing).get(listing_id)
-                if not listing: 
-                    log.error("listing_not_found")
-                    return "Error: Listing not found"
+                if not listing: return "Error: Listing not found"
 
                 # 2. Scrape
                 scraped_data: ScrapedListing = await scraper.scrape_url(listing.source_url)
                 
-                # 3. AI Analysis
-                ai_raw = await ai_engine.analyze_text(scraped_data.raw_text)
-                ai_data = AIAnalysisResult(**ai_raw) # Using Pydantic unpacking
+                # 3. IDEMPOTENCY CHECK (Save Money)
+                # Note: Schema ensures price_predicted is Decimal, so we convert to float only for hashing if needed
+                current_hash = calculate_content_hash(scraped_data.raw_text, float(scraped_data.price_predicted))
+                
+                if listing.content_hash == current_hash and listing.reports:
+                    log.info("audit_skipped_unchanged")
+                    return "Audit Skipped: Content Unchanged"
 
-                # 4. Parallel Forensics
+                # 4. AI Analysis
+                ai_raw = await ai_engine.analyze_text(scraped_data.raw_text)
+                ai_data = AIAnalysisResult(**ai_raw)
+
+                # 5. Forensics (Parallel)
                 cad_task = cadastre.get_official_details(ai_data.address_prediction)
-                comp_task = compliance.check_act_16(cad_data.cadastre_id if 'cad_data' in locals() else None) 
-                # Note: Real logic requires chaining cadastre result to compliance. 
-                # For concurrent gathering, we might need a preliminary address check first.
-                # Simplified parallel execution for now:
                 
                 cad_data, comp_raw, risk_raw, archived_paths = await asyncio.gather(
                     cad_task, 
-                    compliance.check_act_16(None), # Placeholder until Cadastre logic flow is tightened
+                    compliance.check_act_16(None), 
                     city_risk.check_expropriation(None),
                     storage.archive_images(listing_id, scraped_data.image_urls)
                 )
@@ -1490,18 +1561,16 @@ async def run_audit_pipeline(listing_id: int):
                 comp_data = RegistryCheck(**comp_raw)
                 risk_data = RegistryCheck(**risk_raw)
 
-                # 5. Update Listing Meta
-                # Using strict Decimal conversion from Schema
-                chash = calculate_content_hash(scraped_data.raw_text, float(scraped_data.price_predicted))
+                # 6. Update Listing Meta (Using Decimal directly)
                 repo.update_listing_data(
                     listing_id, 
-                    float(scraped_data.price_predicted), 
+                    scraped_data.price_predicted, # CORRECT: Passing Decimal
                     scraped_data.area_sqm, 
                     scraped_data.raw_text, 
-                    chash
+                    current_hash
                 )
 
-                # 6. Scoring & Reporting (Legacy wrapper dict)
+                # 7. Scoring
                 forensic_dict = {
                     "scraped": scraped_data.model_dump(),
                     "ai": ai_data.model_dump(),
@@ -1533,8 +1602,7 @@ async def run_audit_pipeline(listing_id: int):
                 )
                 db.add(report)
                 db.commit()
-
-                log.info("audit_complete", status=status, score=final_score)
+                
                 return f"Audit Complete: {status}"
 
             except Exception as exc:
@@ -2104,69 +2172,6 @@ FILE: ./cookies.txt
 
 
 =========================================
-FILE: ./risk_engine.py
-=========================================
-class RiskEngine:
-    def calculate_risk_score(self, listing_data: dict, forensics_flags: list) -> dict:
-        score = 0
-        warnings = []
-        
-        area = listing_data.get('area', 0)
-        listing_type = listing_data.get('type', '')  # e.g., "2-СТАЕН"
-        price = listing_data.get('price', 0)
-        
-        # --- LOGIC FROM BATCH 2 (The "Space Hack") ---
-        # If it claims to be a 2-bedroom but is under 55 sqm
-        if "2-СТАЕН" in listing_type.upper() and area < 55:
-            score += 20
-            warnings.append({
-                "code": "SUSPICIOUS_AREA", 
-                "msg": f"Small area ({area} sqm) for a 2-bedroom. High risk of 'Space Hack' (Converted Studio)."
-            })
-            # If text confirms it, max out the risk
-            if "CONVERSION_RISK" in forensics_flags:
-                score += 30
-                warnings.append({"code": "CONFIRMED_CONVERSION", "msg": "Seller explicitly admits property is a converted studio (Garsoniera)."});
-
-        # --- LOGIC FROM BATCH 1 (The "Atelier") ---
-        if "ATELIER_STATUS" in forensics_flags:
-            score += 15
-            warnings.append({"code": "LEGAL_STATUS_ATELIER", "msg": "Property is legally an Atelier. Cannot register address easily, higher taxes."})
-
-        # --- LOGIC FROM BATCH 2 (The "Liquidity Trap") ---
-        # Check for flags like "LONG_WAIT_COMPLETION_2028"
-        future_flags = [f for f in forensics_flags if "LONG_WAIT" in f]
-        if future_flags:
-            score += 25
-            for f in future_flags:
-                year = f.split('_')[-1]
-                warnings.append({"code": "LIQUIDITY_TRAP", "msg": f"Construction finishes in {year}. Capital locked for years."})
-
-        # --- LOGIC FROM BATCH 1 (VAT Trap) ---
-        if "VAT_EXCLUDED" in forensics_flags:
-            # Not a 'risk' per se, but a financial shock
-            real_price = price * 1.2
-            warnings.append({"code": "HIDDEN_COST", "msg": f"Advertised price excludes VAT. Real price is ~{real_price:,.0f} EUR."})
-            
-        # --- Ground Floor Logic ---
-        if "GROUND_FLOOR_RISK" in forensics_flags:
-            score += 10
-            warnings.append({"code": "GROUND_FLOOR", "msg": "Property is on the ground floor. Security and privacy risks."})
-
-        verdict = "CLEAN"
-        if score > 50:
-            verdict = "CRITICAL"
-        elif score > 20:
-            verdict = "WARNING"
-
-        return {
-            "risk_score": min(score, 100),
-            "verdict": verdict,
-            "details": warnings
-        }
-
-
-=========================================
 FILE: ./forensics/headers.txt
 =========================================
 HTTP/2 200 
@@ -2188,98 +2193,6 @@ alt-svc: h3=":443"; ma=86400
 =========================================
 FILE: ./forensics/page_utf8.html
 =========================================
-
-
-=========================================
-FILE: ./forensic_check.py
-=========================================
-import httpx
-from bs4 import BeautifulSoup
-import re
-import sys
-
-def forensic_audit(url):
-    # High-fidelity mobile headers to bypass basic WAF
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-        "Accept": "text/html,application/xhtml+xml,xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "bg-BG,bg;q=0.9",
-        "Referer": "https://www.google.bg/",
-        "Connection": "keep-alive"
-    }
-
-    print(f"\n[*] INITIATING DEEP AUDIT: {url}")
-    
-    try:
-        with httpx.Client(headers=headers, follow_redirects=True, timeout=15.0) as client:
-            resp = client.get(url)
-            
-            # IMOT handles encoding via windows-1251. 
-            # We decode manually to prevent iconv-style crashes.
-            raw_content = resp.content.decode('windows-1251', errors='replace')
-            
-            # Save for your manual inspection
-            with open("forensics_dump.html", "w", encoding="utf-8") as f:
-                f.write(raw_content)
-
-            # --- BOT/WAF DETECTION ---
-            if any(term in raw_content.lower() for term in ["captcha", "robot", "security check", "verify you are human"]):
-                print("!!! [BLOCKER] WAF CHALLENGE DETECTED. Page is a Captcha wall. !!!")
-                return
-
-            soup = BeautifulSoup(raw_content, 'html.parser')
-
-            # --- TITLE & STATUS ---
-            title = soup.find('title')
-            print(f"[+] Page Title: {title.text.strip() if title else 'N/A'}")
-            print(f"[+] HTTP Status: {resp.status_code}")
-
-            # --- PILLAR I: PRICE EXTRACTION ---
-            print("\n[*] PILLAR I: PRICE RECONNAISSANCE")
-            # Common IMOT ID for price
-            price_obs = soup.find(id='price_obs')
-            if price_obs:
-                print(f"    [FOUND] ID='price_obs': {price_obs.text.strip()}")
-            else:
-                # Fallback: Look for large font tags which Imot often uses
-                big_text = soup.find_all(style=re.compile("font-size:30px|font-size:25px"))
-                for bt in big_text:
-                    print(f"    [FOUND] Large Font Element: {bt.text.strip()}")
-
-            # --- PILLAR II: AREA & LOCATION ---
-            print("\n[*] PILLAR II: METADATA SCRAPING")
-            text_body = soup.get_text(" ", strip=True)
-            
-            # Search for Price + Currency pattern in decoded text
-            # This detects if the price is just raw text or obfuscated
-            price_matches = re.findall(r'(\d+[\s\d\.]*)\s?(EUR|€|лв|BGN|EUR)', text_body)
-            print(f"    [TEXT SEARCH] Price matches found: {price_matches[:3]}")
-            
-            # Search for Area pattern
-            area_matches = re.findall(r'(\d+)\s?(кв\.м|кв|sq\.m|m2)', text_body, re.IGNORECASE)
-            print(f"    [TEXT SEARCH] Area matches found: {area_matches[:3]}")
-
-            # --- PILLAR III: IMAGE AUDIT ---
-            print("\n[*] PILLAR III: IMAGE ASSET AUDIT")
-            images = []
-            for img in soup.find_all('img'):
-                src = img.get('src') or img.get('data-src')
-                if src:
-                    images.append(src)
-            
-            print(f"    [COUNT] Total Images: {len(images)}")
-            print("    [SAMPLE] First 3 Image Sources:")
-            for img in images[:3]:
-                print(f"      - {img}")
-
-            print("\n[+] Audit Complete. Data saved to forensics_dump.html")
-
-    except Exception as e:
-        print(f"[!] SYSTEM FAILURE: {str(e)}")
-
-if __name__ == "__main__":
-    # Test with the specific listing you provided
-    forensic_audit("https://www.imot.bg/pcgi/imot.cgi?act=5&adv=1c171899111")
 
 
 =========================================
@@ -3141,90 +3054,6 @@ if __name__ == "__main__":
     # YOU NEED TO FILL THIS FROM YOUR BROWSER
     MY_COOKIE = "imot_session_redirect=...; sid=...;" 
     manual_audit("https://www.imot.bg/pcgi/imot.cgi?act=5&adv=1c171899111", MY_COOKIE)
-
-
-=========================================
-FILE: ./forensics_engine.py
-=========================================
-import re
-from datetime import datetime
-
-class ListingForensics:
-    def __init__(self):
-        self.current_year = datetime.now().year
-        
-        # PATTERNS BASED ON REAL IMOT.BG DATA DUMPS
-        self.patterns = {
-            # VAT Trap: "Цената е без ДДС" or "Не се начислява ДДС"
-            "vat_excluded": r"(?i)(цената е без ддс|без ддс|vat excluded|no vat|не се начислява ддс)",
-            
-            # Broker Filter: "Само за частни лица", "Колеги не"
-            "private_only": r"(?i)(само за частни лица|частни лица|без агенции|колеги не)",
-            
-            # Space Hack: "Преустроена гарсониера", "Маломерен"
-            "space_hack": r"(?i)(преустроена? гарсониера|усвоен.*?балкон|кухня.*?коридор|бивша.*?кухня|маломерен|боксониера)",
-            
-            # Legal Status: "Atelier", "Studio"
-            "atelier_statute": r"(?i)(статут.*?ателие|статут на ателие|студио|творческо ателие)",
-            
-            # Floor Risks: "Parter", "Garage"
-            "ground_floor": r"(?i)(партер|етаж 1 от|висок партер|кота 0|сутерен)",
-            
-            # Liquidity Trap: "Act 16 in 2028"
-            "payment_scheme": r"(?i)(\d{1,2}%.*?сега|\d{1,2}%.*?предварителен|\d{1,2}%.*?акт 16)",
-            
-            # Extract future years like "2026 г.", "2028"
-            "future_year": r"(\d{4})\s?г\."
-        }
-
-    def analyze_text(self, description: str, title: str):
-        """
-        Scans the raw text for hidden flags that structured data misses.
-        """
-        flags = []
-        text_combined = f"{title} {description}"
-
-        # 1. VAT Check
-        if re.search(self.patterns["vat_excluded"], text_combined):
-            flags.append("VAT_EXCLUDED")
-
-        # 2. Broker/Private Filter
-        if re.search(self.patterns["private_only"], text_combined):
-            flags.append("DIRECT_CLIENT_ONLY")
-
-        # 3. Space Hack / Conversion
-        if re.search(self.patterns["space_hack"], text_combined):
-            flags.append("CONVERSION_RISK")
-
-        # 4. Legal Statute
-        if re.search(self.patterns["atelier_statute"], text_combined):
-            flags.append("ATELIER_STATUS")
-            
-        # 5. Ground Floor
-        if re.search(self.patterns["ground_floor"], text_combined):
-            flags.append("GROUND_FLOOR_RISK")
-
-        # 6. Future Completion (Liquidity Trap)
-        years = re.findall(self.patterns["future_year"], text_combined)
-        if years:
-            # Filter distinct reasonable years (e.g. 2024-2030)
-            valid_years = [int(y) for y in years if 2020 < int(y) < 2040]
-            if valid_years:
-                max_year = max(valid_years)
-                if max_year > self.current_year + 2:
-                    flags.append(f"LONG_WAIT_COMPLETION_{max_year}")
-                elif max_year > self.current_year:
-                    flags.append("UNDER_CONSTRUCTION")
-
-        return flags
-
-    def normalize_price(self, price_raw: float, flags: list) -> float:
-        """
-        Returns the REAL price the buyer will pay.
-        """
-        if "VAT_EXCLUDED" in flags:
-            return price_raw * 1.20  # Add 20% VAT
-        return price_raw
 
 
 =========================================
