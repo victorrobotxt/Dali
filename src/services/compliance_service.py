@@ -5,7 +5,10 @@ import httpx
 logger = logging.getLogger("compliance_intel")
 
 class ComplianceService:
-    """Checks the Municipal Register for Commissioning Certificates (Act 16)."""
+    """
+    Checks the Municipal Register for Commissioning Certificates (Act 16).
+    Robust against Sofia Municipality (NAG) downtime.
+    """
     
     BASE_URL = 'https://nag.sofia.bg/RegisterCertificateForExploitationBuildings'
     HEADERS = {
@@ -16,7 +19,7 @@ class ComplianceService:
     async def check_act_16(self, cadastre_id: str) -> dict:
         if not cadastre_id: return {"has_act16": False, "checked": False}
 
-        async with httpx.AsyncClient(headers=self.HEADERS, timeout=10.0, verify=False) as client:
+        async with httpx.AsyncClient(headers=self.HEADERS, timeout=8.0, verify=False) as client:
             try:
                 # 1. Prime Search
                 search_params = {'searchQueryId': str(uuid.uuid4()), 'Identifier': cadastre_id}
@@ -24,16 +27,31 @@ class ComplianceService:
 
                 # 2. Fetch Data
                 res = await client.post(f"{self.BASE_URL}/Read", data={'page': '1', 'pageSize': '10'})
+                res.raise_for_status()
                 data = res.json()
 
                 if data and data.get("Data") and len(data["Data"]) > 0:
                     return {
                         "has_act16": True, 
                         "details": f"Found {len(data['Data'])} certificate(s).",
-                        "checked": True
+                        "checked": True,
+                        "registry_status": "LIVE"
                     }
                 
-                return {"has_act16": False, "details": "No certificates found.", "checked": True}
+                return {
+                    "has_act16": False, 
+                    "details": "No certificates found.", 
+                    "checked": True,
+                    "registry_status": "LIVE"
+                }
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError) as e:
+                logger.warning(f"Compliance Registry (Act 16) is DOWN: {e}")
+                return {
+                    "has_act16": False, 
+                    "checked": False, 
+                    "registry_status": "OFFLINE",
+                    "details": "Government Registry Unavailable (NAG Down)"
+                }
             except Exception as e:
-                logger.error(f"Compliance check failed: {e}")
-                return {"has_act16": False, "error": str(e), "checked": False}
+                logger.error(f"Compliance check error: {e}")
+                return {"has_act16": False, "error": str(e), "checked": False, "registry_status": "ERROR"}

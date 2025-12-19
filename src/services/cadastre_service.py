@@ -10,7 +10,7 @@ logger = logging.getLogger("cadastre_intel")
 class CadastreService:
     """
     Interface for the Official Property Registry (Cadastre).
-    Uses direct internal API calls to bypass standard UI friction.
+    Includes resiliency logic (Soft Circuit Breaker) for government downtime.
     """
     BASE_URL = "https://kais.cadastre.bg/bg/Map"
     HEADERS = {
@@ -23,27 +23,35 @@ class CadastreService:
     async def get_official_details(self, address: str) -> Optional[Dict[str, Any]]:
         """
         Orchestrates the search: Address -> Cadastral ID -> Property Details.
+        Returns 'registry_status': 'OFFLINE' if government servers are down.
         """
-        async with httpx.AsyncClient(headers=self.HEADERS, timeout=15.0, verify=False) as client:
+        async with httpx.AsyncClient(headers=self.HEADERS, timeout=8.0, verify=False) as client:
             try:
                 # 1. Resolve Address to Identifier
                 identifier = await self._resolve_address_to_id(client, address)
+                if identifier == "OFFLINE":
+                     return {"cadastre_id": None, "official_area": 0.0, "registry_status": "OFFLINE", "error": "KAIS Timeout"}
+                
                 if not identifier:
                     logger.warning(f"Cadastre resolution failed for: {address}")
-                    return None
+                    return {"cadastre_id": None, "official_area": 0.0, "registry_status": "NOT_FOUND"}
 
                 # 2. Fetch Details using Identifier
                 details = await self._fetch_property_data(client, identifier)
                 return details
 
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                logger.error(f"Cadastre connection failed (Down/Slow): {e}")
+                return {"cadastre_id": None, "official_area": 0.0, "registry_status": "OFFLINE", "error": "Connection Timeout"}
             except Exception as e:
                 logger.error(f"Cadastre lookup error: {e}")
-                return None
+                return {"cadastre_id": None, "official_area": 0.0, "registry_status": "ERROR", "error": str(e)}
 
     async def _resolve_address_to_id(self, client: httpx.AsyncClient, address: str) -> Optional[str]:
         try:
             # A. Initialize Session (CSRF Token)
             page = await client.get(self.BASE_URL)
+            page.raise_for_status()
             soup = BeautifulSoup(page.text, 'html.parser')
             token_input = soup.find('input', {'name': '__RequestVerificationToken'})
             if not token_input: return None
@@ -65,7 +73,9 @@ class CadastreService:
             if data.get('Data'):
                 return data['Data'][0].get('Number') # Return first match
             return None
-        except:
+        except (httpx.TimeoutException, httpx.ConnectError):
+            return "OFFLINE"
+        except Exception:
             return None
 
     async def _fetch_property_data(self, client: httpx.AsyncClient, identifier: str) -> Dict[str, Any]:
@@ -87,7 +97,7 @@ class CadastreService:
             json_data = res.json()
             
             if not json_data.get('Data'):
-                return {"official_area": 0.0, "type": "Unknown", "cadastre_id": identifier}
+                return {"official_area": 0.0, "type": "Unknown", "cadastre_id": identifier, "registry_status": "LIVE"}
 
             object_params = json_data['Data'][0]
             info_res = await client.get(f"{self.BASE_URL}/GetObjectInfo", params=object_params)
@@ -101,7 +111,8 @@ class CadastreService:
             return {
                 "cadastre_id": identifier,
                 "official_area": area,
-                "raw_registry_text": raw_text[:300]
+                "raw_registry_text": raw_text[:300],
+                "registry_status": "LIVE"
             }
-        except:
-            return {"official_area": 0.0, "cadastre_id": identifier, "error": "Parse Fail"}
+        except Exception as e:
+            return {"official_area": 0.0, "cadastre_id": identifier, "error": str(e), "registry_status": "ERROR"}
