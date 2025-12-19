@@ -1,13 +1,13 @@
 import os
 from pydantic_settings import BaseSettings
-from pydantic import Field, field_validator
+from pydantic import Field
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Glashaus"
     VERSION: str = "1.0.0-PROD"
     ENV: str = Field("DEV", description="DEV or PROD")
     
-    # SECURITY: No defaults allowed. App must crash if these are missing.
+    # SECURITY FIX: No default value. Fails safely if missing.
     GEMINI_API_KEY: str = Field(..., min_length=10, description="Must be set in .env")
     
     # Database

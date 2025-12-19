@@ -6,6 +6,10 @@ from bs4 import BeautifulSoup
 from src.schemas import ScrapedListing
 from src.core.logger import logger
 
+# CUSTOM EXCEPTIONS
+class WAFBlockError(Exception): pass
+class ParsingError(Exception): pass
+
 class ScraperService:
     def __init__(self, client: httpx.AsyncClient, simulation_mode=False):
         self.client = client
@@ -16,7 +20,6 @@ class ScraperService:
         }
 
     async def _parse_html(self, content: str, url: str) -> ScrapedListing:
-        """CPU-bound parsing logic run in thread."""
         soup = BeautifulSoup(content, 'html.parser')
         text = soup.get_text(" ", strip=True)
 
@@ -26,7 +29,6 @@ class ScraperService:
         
         if p_match:
             try:
-                # Remove spaces, ensure standard decimal format
                 clean_str = re.sub(r'[^\d]', '', p_match.group(1))
                 price_decimal = Decimal(clean_str)
             except InvalidOperation:
@@ -52,19 +54,19 @@ class ScraperService:
         
         try:
             resp = await self.client.get(clean_url, headers=self.headers, follow_redirects=True)
-            # Handle Windows-1251 encoding common in BG sites
             content = resp.content.decode('windows-1251', errors='ignore')
             
-            if "captcha" in content.lower():
+            # WAF DETECTION
+            if any(x in content.lower() for x in ["captcha", "security check", "verify you are human"]):
                 log.error("waf_block_detected")
-                raise ConnectionError("WAF_BLOCK: Captcha triggered")
+                raise WAFBlockError("CAPTCHA Triggered: Rotation Required")
 
-            # CRITICAL: Offload CPU-bound parsing to prevent blocking the Event Loop
             result = await asyncio.to_thread(self._parse_html, content, clean_url)
-            
             log.info("scrape_success", price=str(result.price_predicted), area=result.area_sqm)
             return result
             
+        except WAFBlockError as we:
+            raise we
         except Exception as e:
             log.error("scrape_failed", error=str(e))
             raise e

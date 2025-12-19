@@ -1,10 +1,8 @@
 from src.core.sofia_data import SOFIA_ADMIN_MAP
+from src.core.patterns import ForensicPatterns  # Import the new patterns
 from datetime import datetime
 
 class LegalEngine:
-    """
-    Translates Bulgarian Property Law into code-based risk metrics.
-    """
     def analyze_listing(self, scraped_data: dict, ai_data: dict):
         risk_report = {
             "total_legal_score": 0,
@@ -14,7 +12,17 @@ class LegalEngine:
         }
 
         raw_text = scraped_data.get("raw_text", "").upper()
-        rayon = ai_data.get("neighborhood", "Unknown").upper()
+        
+        # 0. REGEX FORENSICS (New Layer)
+        regex_flags = ForensicPatterns.extract_flags(raw_text)
+        risk_report["flags"].extend(regex_flags)
+        
+        # Apply score penalties for regex flags
+        if "VAT_EXCLUDED" in regex_flags:
+            risk_report["flags"].append("FINANCIAL: Advertised price is likely 20% higher (+VAT).")
+        if "CONVERSION_RISK" in regex_flags:
+             risk_report["total_legal_score"] += 30
+             risk_report["flags"].append("PHYSICAL: High risk of 'Space Hack' (Garage/Corridor conversion).")
 
         # Pillar I: Statutory Classification (The Atelier Trap)
         p1_score = 0
@@ -24,6 +32,7 @@ class LegalEngine:
                 p1_score += 15
                 risk_report["flags"].append("INSOLENCE_FAILURE: North-facing Atelier cannot legally be an apartment.")
             
+            rayon = ai_data.get("neighborhood", "Unknown").upper()
             admin_data = SOFIA_ADMIN_MAP.get(rayon, {"strictness": 3})
             if admin_data["strictness"] >= 4:
                 p1_score += 20

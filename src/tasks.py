@@ -1,7 +1,7 @@
 from src.worker import celery_app
 from src.db.session import SessionLocal
 from src.db.models import Listing, Report, ReportStatus
-from src.services.scraper_service import ScraperService
+from src.services.scraper_service import ScraperService, WAFBlockError
 from src.services.ai_engine import GeminiService
 from src.services.legal_engine import LegalEngine
 from src.services.report_generator import AttorneyReportGenerator
@@ -26,7 +26,9 @@ def run_async(coroutine):
     finally:
         loop.close()
 
-@celery_app.task(name="src.tasks.audit_listing", bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
+@celery_app.task(name="src.tasks.audit_listing", bind=True, 
+                 autoretry_for=(WAFBlockError, httpx.ConnectError), 
+                 retry_backoff=True, max_retries=5)
 def audit_listing_task(self, listing_id: int):
     return run_async(run_audit_pipeline(listing_id))
 
@@ -34,17 +36,14 @@ async def run_audit_pipeline(listing_id: int):
     log = logger.bind(listing_id=listing_id)
     log.info("audit_started")
 
-    # Shared Session for Scraper + Cadastre + Compliance + CityRisk
-    # 30s timeout, Standard SSL verification enabled
     async with httpx.AsyncClient(timeout=30.0) as http_client:
         with SessionLocal() as db:
             try:
-                # 1. Initialize Services (Injecting Shared Client)
+                # 1. Init Services
                 repo = RealEstateRepository(db)
                 scraper = ScraperService(client=http_client, simulation_mode=(settings.GEMINI_API_KEY == "mock-key"))
                 ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
                 
-                # All Registry Services now share the TCP connection pool
                 cadastre = CadastreService(client=http_client)
                 compliance = ComplianceService(client=http_client)
                 city_risk = CityRiskService(client=http_client)
@@ -55,27 +54,29 @@ async def run_audit_pipeline(listing_id: int):
                 risk_engine = RiskEngine()
 
                 listing = db.query(Listing).get(listing_id)
-                if not listing: 
-                    log.error("listing_not_found")
-                    return "Error: Listing not found"
+                if not listing: return "Error: Listing not found"
 
                 # 2. Scrape
                 scraped_data: ScrapedListing = await scraper.scrape_url(listing.source_url)
                 
-                # 3. AI Analysis
-                ai_raw = await ai_engine.analyze_text(scraped_data.raw_text)
-                ai_data = AIAnalysisResult(**ai_raw) # Using Pydantic unpacking
+                # 3. IDEMPOTENCY CHECK (Save Money)
+                # Note: Schema ensures price_predicted is Decimal, so we convert to float only for hashing if needed
+                current_hash = calculate_content_hash(scraped_data.raw_text, float(scraped_data.price_predicted))
+                
+                if listing.content_hash == current_hash and listing.reports:
+                    log.info("audit_skipped_unchanged")
+                    return "Audit Skipped: Content Unchanged"
 
-                # 4. Parallel Forensics
+                # 4. AI Analysis
+                ai_raw = await ai_engine.analyze_text(scraped_data.raw_text)
+                ai_data = AIAnalysisResult(**ai_raw)
+
+                # 5. Forensics (Parallel)
                 cad_task = cadastre.get_official_details(ai_data.address_prediction)
-                comp_task = compliance.check_act_16(cad_data.cadastre_id if 'cad_data' in locals() else None) 
-                # Note: Real logic requires chaining cadastre result to compliance. 
-                # For concurrent gathering, we might need a preliminary address check first.
-                # Simplified parallel execution for now:
                 
                 cad_data, comp_raw, risk_raw, archived_paths = await asyncio.gather(
                     cad_task, 
-                    compliance.check_act_16(None), # Placeholder until Cadastre logic flow is tightened
+                    compliance.check_act_16(None), 
                     city_risk.check_expropriation(None),
                     storage.archive_images(listing_id, scraped_data.image_urls)
                 )
@@ -83,18 +84,16 @@ async def run_audit_pipeline(listing_id: int):
                 comp_data = RegistryCheck(**comp_raw)
                 risk_data = RegistryCheck(**risk_raw)
 
-                # 5. Update Listing Meta
-                # Using strict Decimal conversion from Schema
-                chash = calculate_content_hash(scraped_data.raw_text, float(scraped_data.price_predicted))
+                # 6. Update Listing Meta (Using Decimal directly)
                 repo.update_listing_data(
                     listing_id, 
-                    float(scraped_data.price_predicted), 
+                    scraped_data.price_predicted, # CORRECT: Passing Decimal
                     scraped_data.area_sqm, 
                     scraped_data.raw_text, 
-                    chash
+                    current_hash
                 )
 
-                # 6. Scoring & Reporting (Legacy wrapper dict)
+                # 7. Scoring
                 forensic_dict = {
                     "scraped": scraped_data.model_dump(),
                     "ai": ai_data.model_dump(),
@@ -126,8 +125,7 @@ async def run_audit_pipeline(listing_id: int):
                 )
                 db.add(report)
                 db.commit()
-
-                log.info("audit_complete", status=status, score=final_score)
+                
                 return f"Audit Complete: {status}"
 
             except Exception as exc:

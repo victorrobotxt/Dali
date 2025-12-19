@@ -1,6 +1,6 @@
-from sqlalchemy.dialects.postgresql import insert
+from decimal import Decimal
 from sqlalchemy.orm import Session
-from src.db.models import Listing, Report, PriceHistory
+from src.db.models import Listing, PriceHistory
 from src.core.utils import normalize_url
 
 class RealEstateRepository:
@@ -17,12 +17,15 @@ class RealEstateRepository:
         self.db.refresh(new_l)
         return new_l
 
-    def update_listing_data(self, listing_id: int, price: float, area: float, desc: str, chash: str):
+    # TYPE SAFETY FIX: price is now Decimal
+    def update_listing_data(self, listing_id: int, price: Decimal, area: float, desc: str, chash: str):
         listing = self.db.query(Listing).get(listing_id)
         if listing:
-            if listing.price_bgn and listing.price_bgn != price:
+            # SQLAlchemy handles Decimal comparison correctly here
+            if listing.price_bgn is not None and listing.price_bgn != price:
                 history = PriceHistory(listing_id=listing_id, price_bgn=listing.price_bgn)
                 self.db.add(history)
+            
             listing.price_bgn = price
             listing.advertised_area_sqm = area
             listing.description_raw = desc
