@@ -1,17 +1,14 @@
-from pydantic import BaseModel, Field, condecimal
+from pydantic import BaseModel, Field
 from decimal import Decimal
-from typing import List, Optional, Literal, Dict
+from typing import List, Optional, Literal
 
 class ScrapedListing(BaseModel):
     source_url: str
     raw_text: str
     price_predicted: Decimal
     area_sqm: Decimal
-    neighborhood: str # Claimed by broker
+    neighborhood: str 
     image_urls: List[str] = []
-
-    class Config:
-        json_encoders = {Decimal: str}
 
 class HeatingInventory(BaseModel):
     ac_units: int = 0
@@ -35,6 +32,7 @@ class GeoVerification(BaseModel):
     lat: Optional[float] = None
     lng: Optional[float] = None
     warning: Optional[str] = None
+    best_address: Optional[str] = None
 
 class CadastreData(BaseModel):
     official_area: float = 0.0

@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Fri Dec 19 21:29:07 EET 2025
+Fri Dec 19 22:07:38 EET 2025
 
 
 --- GIT HISTORY ---
-* 698eb25 (HEAD -> main) refactor(core): implement hybrid scraping fallback and multimodal AI forensics
+* 52420e1 (HEAD -> main) refactor(core): implement hybrid scraping fallback and multimodal AI forensics Key Changes in this Commit:  * Multimodal AI Integration: Upgraded the GeminiService to use gemini-1.5-flash, enabling vision-based forensics by processing listing images alongside text.  * Forensic Property Analysis: Implemented a "Senior Real Estate Forensic Detective" prompt to detect "Atelier" status traps, identify architectural eras (e.g., Pre-1989 Panel vs. Post-2000 Brick), and perform orientation checks.  * Geospatial Verification: Added a new GeospatialService that uses the Google Maps Geocoding API to cross-reference AI-detected landmarks and addresses against the neighborhood claimed by the broker.  * Location Fraud Detection: The audit pipeline now automatically elevates risk scores (minimum of 70) if the geospatial verification finds a mismatch between the ad and visual evidence.  * Enhanced Scraper: Updated ScraperService to better extract neighborhood data and handle image URLs from imot.bg more reliably.
+* 698eb25 refactor(core): implement hybrid scraping fallback and multimodal AI forensics
 * 6f470a6 refactor(core): production hardening, type safety, and architecture cleanup
 * 0f7d54d refactor(core): production hardening, type safety, and architecture cleanup
 * d13df83 refactor(core): harden security, async concurrency, and financial precision
@@ -22,7 +23,6 @@ Fri Dec 19 21:29:07 EET 2025
 * a087b30 feat(backend): implement vision layer, harden worker logic, and add regex parsing
 * 4987d66 feat(infra): add Nginx gateway, CORS, and live scraping logic
 * ae76a80 refactor(core): upgrade architecture to Celery/Redis and harden AI logic
-* b7f3797 refactor(core): migrate to Redis/Celery queue and add Alembic migrations
 
 
 --- FILE STRUCTURE ---
@@ -400,8 +400,9 @@ class Settings(BaseSettings):
     VERSION: str = "1.0.0-PROD"
     ENV: str = Field("DEV", description="DEV or PROD")
     
-    # SECURITY FIX: No default value. Fails safely if missing.
-    GEMINI_API_KEY: str = Field(..., min_length=10, description="Must be set in .env")
+    # API KEYS
+    GEMINI_API_KEY: str = Field(..., min_length=10, description="Google Gemini API Key")
+    GOOGLE_MAPS_API_KEY: str = Field(..., min_length=10, description="Google Maps Geocoding API Key")
     
     # Database
     POSTGRES_USER: str = Field(..., min_length=1)
@@ -427,15 +428,12 @@ FILE: ./src/core/utils.py
 =========================================
 import re
 import hashlib
-from urllib.parse import urlparse
 
 def extract_imot_id(url: str) -> str:
-    """Extracts unique listing ID to prevent duplicates."""
     match = re.search(r'(?:adv=|obiava-)([a-z0-9]+)', url)
     return match.group(1) if match else "unknown"
 
 def normalize_url(url: str) -> str:
-    """Force mobile subdomain to reduce WAF friction."""
     if "imot.bg" in url:
         return url.replace("www.imot.bg", "m.imot.bg")
     return url
@@ -444,6 +442,16 @@ def calculate_content_hash(text: str, price: float) -> str:
     clean_text = re.sub(r'\s+', ' ', text).strip().lower()
     raw = f"{clean_text}{price}".encode('utf-8')
     return hashlib.sha256(raw).hexdigest()
+
+def normalize_sofia_street(address: str) -> str:
+    """Strips common Sofia prefixes that confuse the Cadastre search."""
+    if not address: return ""
+    # Remove 'ul.', 'bul.', 'zh.k', 'kv.' etc.
+    patterns = [r'(?i)ул\.', r'(?i)бул\.', r'(?i)ж\.к\.', r'(?i)кв\.', r'(?i)гр\. София,?\s*']
+    clean = address
+    for p in patterns:
+        clean = re.sub(p, '', clean)
+    return clean.strip()
 
 
 =========================================
@@ -530,87 +538,50 @@ class ForensicPatterns:
 FILE: ./src/services/ai_engine.py
 =========================================
 import google.generativeai as genai
-from pydantic import BaseModel, Field
-from typing import List, Optional
 from PIL import Image
 import os
 from src.core.logger import logger
-
-class AIAnalysisSchema(BaseModel):
-    address_prediction: str = Field(description="Predicted address or neighborhood based on text/visual landmarks")
-    neighborhood: str
-    is_atelier: bool = Field(description="True if building style or text suggests non-residential status")
-    net_living_area: float
-    construction_year: int
-    building_type: str = Field(description="Panel, Brick, EPC, or New Construction")
-    confidence: int
-    visual_red_flags: List[str] = Field(default=[], description="Physical discrepancies like windowless kitchens or office-style windows")
+from src.schemas import AIAnalysisResult
 
 class GeminiService:
     def __init__(self, api_key: str):
         if api_key != "mock-key":
             genai.configure(api_key=api_key)
-            # Upgrading to 1.5-flash which supports high-volume vision for low cost
             self.model = genai.GenerativeModel('gemini-1.5-flash')
         else:
             self.model = None
 
     async def analyze_listing_multimodal(self, text: str, image_paths: List[str]) -> dict:
-        """
-        Implements the Vision AI forensics suggested by Google Cloud.
-        Combines raw text with visual evidence from archived listing photos.
-        """
         if not self.model:
-            return {
-                "address_prediction": "Simulated", 
-                "confidence": 0, 
-                "neighborhood": "Unknown", 
-                "is_atelier": False, 
-                "net_living_area": 0, 
-                "construction_year": 2024,
-                "building_type": "Unknown"
-            }
+            return {"address_prediction": "Mock", "confidence_score": 0, "neighborhood_match": "Unverified"}
         
-        # Load and validate images for the Vision API
         visual_inputs = []
-        for path in image_paths[:5]: # Use top 5 images to optimize tokens
+        for path in image_paths[:8]:
             if os.path.exists(path):
                 try:
-                    visual_inputs.append(Image.open(path))
-                except Exception as e:
-                    logger.warning("image_load_failed", path=path, error=str(e))
+                    img = Image.open(path)
+                    img.thumbnail((1024, 1024))
+                    visual_inputs.append(img)
+                except Exception:
+                    continue
 
-        prompt = f"""
-        [ROLE] SENIOR REAL ESTATE FORENSIC DETECTIVE (SOFIA, BULGARIA)
-        [OBJECTIVE] Extract ground truth from these photos and the listing text.
-        
-        [TASKS]
-        1. Compare visual building style with the described neighborhood (e.g. Panel in Lozenets?).
-        2. Inspect 'Atelier' signs: office-style glass, lack of balconies, or commercial ground floors.
-        3. Detect 'Space Hacks': kitchens in hallways, beds in windowless rooms.
-        4. Look for landmarks/shop signs in the background to pin-point the address.
-        
-        [LISTING TEXT]
-        {text[:4000]}
-        """
-        
-        # Merge text and images into a single multimodal request
-        content = [prompt] + visual_inputs
+        with open("prompts/detective_prompt_v1.md", "r") as f:
+            system_prompt = f.read()
+
+        content = [f"{system_prompt}\n\n[TEXT]:\n{text[:4000]}", *visual_inputs]
         
         try:
             resp = self.model.generate_content(
                 content, 
                 generation_config={
                     "response_mime_type": "application/json", 
-                    "response_json_schema": AIAnalysisSchema.model_json_schema()
+                    "response_json_schema": AIAnalysisResult.model_json_schema()
                 }
             )
-            return AIAnalysisSchema.model_validate_json(resp.text).model_dump()
+            return AIAnalysisResult.model_validate_json(resp.text).model_dump()
         except Exception as e:
-            logger.error("ai_multimodal_failed", error=str(e))
-            # Fallback to a basic structure
-            return {"address_prediction": "Error", "neighborhood": "Unknown", "confidence": 0}
-
+            logger.error("ai_failed", error=str(e))
+            return {"address_prediction": "Error", "confidence_score": 0}
 
 
 =========================================
@@ -734,6 +705,7 @@ class ScraperService:
         }
 
     async def scrape_url(self, url: str) -> ScrapedListing:
+        # Standardize to mobile to reduce WAF friction
         clean_url = url.replace("www.imot.bg", "m.imot.bg")
         log = logger.bind(url=clean_url)
         
@@ -773,7 +745,7 @@ class ScraperService:
             try:
                 await page.goto(url, wait_until="domcontentloaded")
                 
-                # Wait for WAF to clear or price to appear (Max 10s)
+                # Wait for core data to appear (Max 10s)
                 try:
                     await page.wait_for_selector('div#price, .price, .advHeader', timeout=10000)
                 except Exception:
@@ -790,28 +762,43 @@ class ScraperService:
         soup = BeautifulSoup(content, 'html.parser')
         text = soup.get_text(" ", strip=True)
 
-        # Price Parsing
+        # 1. Price Parsing
         p_match = re.search(r'([\d\s\.,]+)\s?(?:EUR|€|лв)', text)
         price_decimal = Decimal("0.00")
         if p_match:
             try:
                 clean_str = re.sub(r'[^\d]', '', p_match.group(1))
                 price_decimal = Decimal(clean_str)
-            except InvalidOperation:
+            except (InvalidOperation, ValueError):
                 logger.warning("price_parse_failed", url=url)
 
-        # Area Parsing
+        # 2. Area Parsing
         a_match = re.search(r'(\d+)\s?(?:kv|кв)', text.lower())
         area = Decimal(a_match.group(1)) if a_match else Decimal("0.00")
         
-        images = [img.get('src') for img in soup.find_all('img') if 'imot.bg' in (img.get('src') or "")]
+        # 3. Neighborhood Extraction (Crucial for Geo-Forensics)
+        # Matches patterns like "Люлин 6, град София" or "град София, Люлин 6"
+        kv_match = re.search(r'([\w\s\d-]+),\s*град София', text)
+        if not kv_match:
+            kv_match = re.search(r'град София,\s*([\w\s\d-]+)', text)
+        
+        neighborhood = kv_match.group(1).strip() if kv_match else "Unknown"
+
+        # 4. Image Extraction
+        images = []
+        for img in soup.find_all('img'):
+            src = img.get('src') or img.get('data-src')
+            if src and 'imot.bg' in src and 'picturess' in src:
+                if src.startswith("//"): src = "https:" + src
+                images.append(src)
 
         return ScrapedListing(
             source_url=url,
             raw_text=text,
             price_predicted=price_decimal,
             area_sqm=area,
-            image_urls=images
+            neighborhood=neighborhood,
+            image_urls=list(set(images)) # Deduplicate
         )
 
 
@@ -822,58 +809,59 @@ from typing import Dict, Any
 
 class RiskEngine:
     def calculate_score_v2(self, data: Dict) -> Dict[str, Any]:
-        """
-        Consolidated Risk Calculation using all 3 sources.
-        """
         score = 0
         flags = []
         is_fatal = False
         
+        scraped = data.get("scraped", {})
         ai = data.get("ai", {})
         cad = data.get("cadastre") or {}
         comp = data.get("compliance", {})
         risk = data.get("city_risk", {})
+        geo = data.get("geo", {})
         
         # 1. EXPROPRIATION (The Nuke)
         if risk.get("is_expropriated"):
             score = 100
             is_fatal = True
-            flags.append("CRITICAL: Property is listed for EXPROPRIATION (Seizure).")
+            flags.append("CRITICAL: Property is listed for EXPROPRIATION (Municipal Seizure).")
 
-        # 2. ACT 16 (The Ghost)
-        # Only penalize if we actually checked and found nothing, and building year implies we should have it
-        if comp.get("checked") and not comp.get("has_act16"):
-            # If AI says it's old (pre-2000), missing record might just mean digitization lag.
-            # If AI says it's new (post-2010), missing record is suspicious.
-            year = ai.get("construction_year", 0)
-            if year > 2010:
-                score += 50
-                flags.append("HIGH RISK: No Commissioning Certificate (Act 16) found for modern building.")
-            else:
-                score += 10
-                flags.append("WARN: Act 16 not digitized or missing.")
+        # 2. LOCATION INTEGRITY
+        if geo and not geo.get("match"):
+            score += 40
+            flags.append(geo.get("warning", "Location Fraud Detected."))
 
-        # 3. AREA FRAUD (The Squeeze)
-        adv_area = data["scraped"].get("area", 0)
-        off_area = cad.get("official_area", 0)
-        
+        # 3. CONSTRUCTION MATURITY (ACT 16 Logic)
+        # Penalize if building is modern (>2010) but no cert is found in the registry
+        est_year = ai.get("construction_year_est", 0)
+        if est_year > 2010 and not comp.get("has_act16") and comp.get("checked"):
+            score += 50
+            flags.append(f"HIGH RISK: Building estimated from {est_year}, but no Act 16 found in NAG records.")
+
+        # 4. INFRASTRUCTURE MISMATCH (TEC/Radiator Logic)
+        raw_text = scraped.get("raw_text", "").upper()
+        if "ТЕЦ" in raw_text or "ЦЕНТРАЛНО ОТОПЛЕНИЕ" in raw_text:
+            inventory = ai.get("heating_inventory", {})
+            if inventory.get("radiators", 0) == 0:
+                score += 15
+                flags.append("WARN: Listing claims Central Heating (TEC), but 0 radiators detected visually.")
+
+        # 5. AREA FRAUD
+        adv_area = float(scraped.get("area_sqm", 0))
+        off_area = float(cad.get("official_area", 0))
         if adv_area > 0 and off_area > 0:
             diff_ratio = (adv_area - off_area) / off_area
-            if diff_ratio > 0.25: # >25% discrepancy
+            if diff_ratio > 0.25:
                 score += 30
                 flags.append(f"SCAM: Advertised area {adv_area}m is {diff_ratio:.1%} larger than Official {off_area}m.")
-        
-        # 4. LEGAL / ATELIER
-        if ai.get("is_atelier", False):
+
+        # 6. ATELIER STATUS
+        if ai.get("is_atelier"):
             score += 25
-            flags.append("LEGAL: Atelier status (Non-residential).")
+            flags.append("LEGAL: Non-residential 'Atelier' status confirmed via vision analysis.")
 
         final_score = 100 if is_fatal else min(score, 100)
         return {"score": final_score, "flags": flags, "is_fatal": is_fatal}
-
-    # Legacy V1 (Keep for backward compat if needed)
-    def calculate_score(self, advertised, ai, cadastre_area=None):
-        return self.calculate_score_v2({"scraped": advertised, "ai": ai, "cadastre": {"official_area": cadastre_area}})
 
 
 =========================================
@@ -944,25 +932,57 @@ class CadastreService:
 =========================================
 FILE: ./src/services/geospatial_service.py
 =========================================
-from typing import Optional, Dict
+import httpx
+from src.core.logger import logger
+from src.schemas import GeoVerification
+from typing import Optional
 
 class GeospatialService:
-    """
-    Handles Google Maps / Street View verification.
-    """
-    def __init__(self, api_key: str = "mock-key"):
+    def __init__(self, api_key: str):
         self.api_key = api_key
+        self.base_url = "https://maps.googleapis.com/maps/api/geocode/json"
 
-    def verify_location(self, address: str) -> Dict[str, any]:
-        """
-        TODO: Implement Google Maps Geocoding API.
-        Should return { "lat": float, "lng": float, "street_view_exists": bool }
-        """
+    async def verify_neighborhood(self, ai_prediction: str, ai_landmarks: list, claimed_kvartal: str) -> GeoVerification:
         if self.api_key == "mock-key":
-            return {"lat": 42.6977, "lng": 23.3219, "verified": False}
+            return GeoVerification(match=True, detected_neighborhood="Mock", confidence=100)
+
+        # Build a search query prioritizing specific clues from Gemini
+        search_query = f"{ai_prediction} {' '.join(ai_landmarks)}, Sofia, Bulgaria"
         
-        # Real implementation will go here
-        return {}
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(self.base_url, params={"address": search_query, "key": self.api_key})
+            data = resp.json()
+
+            if data["status"] != "OK" or not data["results"]:
+                return GeoVerification(match=True, detected_neighborhood="Not Found", confidence=0)
+
+            result = data["results"][0]
+            lat_lng = result["geometry"]["location"]
+            formatted_address = result.get("formatted_address", "")
+            
+            # Extract neighborhood from Google components
+            detected = ""
+            for comp in result["address_components"]:
+                if any(t in comp["types"] for t in ["sublocality", "neighborhood", "political"]):
+                    detected = comp["long_name"]
+                    break
+            
+            # Cross-reference
+            claimed_norm = claimed_kvartal.lower().replace("гр.", "").strip()
+            detected_norm = detected.lower().strip()
+            
+            # Match if strings overlap (e.g., "Krastova Vada" vs "Manastirski Livadi - East")
+            is_match = claimed_norm in detected_norm or detected_norm in claimed_norm
+            
+            return GeoVerification(
+                match=is_match,
+                detected_neighborhood=detected,
+                confidence=90,
+                lat=lat_lng["lat"],
+                lng=lat_lng["lng"],
+                warning=None if is_match else f"LOCATION FRAUD: Ad claims {claimed_kvartal}, but Vision/Maps identifies {detected}.",
+                best_address=formatted_address
+            )
 
 
 =========================================
@@ -1114,115 +1134,63 @@ FILE: ./src/services/report_generator.py
 import datetime
 
 class AttorneyReportGenerator:
-    """
-    Transforms quantitative risk data and forensic evidence into a senior legal brief.
-    Now includes Registry Checks (Act 16, Expropriation) and Cadastre Verification.
-    """
     def generate_legal_brief(self, listing_data: dict, risk_data: dict, ai_data: dict) -> str:
-        # risk_data is now a merged dictionary of {**legal_res, **score_res, "forensics": ...}
-        
-        score = risk_data.get("score", 0) # V2 Score
+        score = risk_data.get("score", 0)
         flags = risk_data.get("flags", [])
         forensics = risk_data.get("forensics", {})
-        
-        compliance = forensics.get("compliance", {})
-        city_risk = forensics.get("city_risk", {})
-        cadastre = forensics.get("cadastre", {})
+        geo = forensics.get("geo", {})
 
-        # 1. Determine Header Status
         status_symbol = "🟢 CLEAR"
-        if risk_data.get("is_fatal") or "ABORT" in risk_data.get("gatekeeper_verdict", ""):
-            status_symbol = "🔴 DO NOT PROCEED"
-        elif score > 60:
-            status_symbol = "🟠 HIGH RISK ASSET"
-        elif score > 30:
-            status_symbol = "🟡 CAUTION ADVISED"
+        if risk_data.get("is_fatal"): status_symbol = "🔴 DO NOT PROCEED"
+        elif score > 60: status_symbol = "🟠 HIGH RISK ASSET"
+        elif score > 30: status_symbol = "🟡 CAUTION ADVISED"
 
-        # 2. Build Sections
         sections = [
             f"# {status_symbol} (Risk Score: {score}/100)",
             f"**Generated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
             "\n## I. Executive Summary",
-            self._summary(risk_data, city_risk),
-            "\n## II. Registry & Compliance Checks",
-            self._compliance_section(compliance, city_risk),
-            "\n## III. Cadastral Integrity",
-            self._cadastre_section(listing_data, cadastre),
-            "\n## IV. Legal & Statutory Risks",
-            self._legal_section(ai_data, risk_data),
+            self._summary(risk_data),
+            "\n## II. Visual Cross-Examination (Forensic AI)",
+            self._visual_forensics(ai_data, geo, listing_data),
+            "\n## III. Registry & Compliance Checks",
+            self._compliance_section(forensics.get("compliance", {}), forensics.get("city_risk", {})),
+            "\n## IV. Cadastral Integrity",
+            self._cadastre_section(listing_data, forensics.get("cadastre", {})),
             "\n## V. Identified Risk Factors",
             "\n".join([f"- {f}" for f in flags]) if flags else "- No specific flags raised."
         ]
-        
         return "\n".join(sections)
 
-    def _summary(self, risk, city_risk):
-        if city_risk.get("is_expropriated"):
-            return "**CRITICAL WARNING:** This property is flagged for EXPROPRIATION (Municipal Seizure). Immediate suspension of interest recommended."
-        if risk.get("is_fatal"):
-            return "Fatal legal defects detected. The asset is legally toxic."
-        if risk.get("score", 0) > 50:
-            return "Significant administrative or physical discrepancies detected. Negotiating power is high, but so is future friction."
-        return "The asset appears to align with standard Sofia residential norms. Proceed to physical inspection."
+    def _summary(self, risk):
+        if risk.get("is_fatal"): return "CRITICAL: The property has fatal registry or location defects."
+        if risk.get("score", 0) > 50: return "WARNING: Significant discrepancies detected between advertisement and forensic truth."
+        return "Asset appears consistent with standard Sofia residential norms."
 
-    def _compliance_section(self, compliance, city_risk):
-        # 1. Expropriation
-        expr_status = "✅ CLEAR"
-        if city_risk.get("is_expropriated"): expr_status = "🔴 **EXPROPRIATION RISK DETECTED**"
-        elif city_risk.get("registry_status") == "OFFLINE": expr_status = "⚪ CHECK FAILED (Registry Offline)"
+    def _visual_forensics(self, ai, geo, scraped):
+        geo_status = "✅ Confirmed" if geo.get("match") else "❌ MISMATCH"
+        neighborhood_line = f"- **Location Verification:** {geo_status} (Broker claims {scraped.get('neighborhood')}, Vision suggests {geo.get('detected_neighborhood')})"
         
-        # 2. Act 16
-        act16_status = "❓ UNKNOWN"
-        if compliance.get("checked"):
-            if compliance.get("has_act16"): act16_status = "✅ YES (Certificate Found)"
-            else: act16_status = "⚠️ **MISSING/NOT DIGITIZED**"
-        
-        if compliance.get("registry_status") == "OFFLINE":
-            act16_status = "⚪ CHECK FAILED (Registry Offline)"
-
-        return f"""
-- **Municipal Expropriation List:** {expr_status}
-- **Commissioning Certificate (Act 16):** {act16_status}
-        """
-
-    def _cadastre_section(self, listing, cadastre):
-        status = cadastre.get("registry_status", "LIVE")
-        if status == "OFFLINE":
-            return "- **Status:** ⚪ Registry Offline. Cannot verify area."
-        
-        official_area = cadastre.get("official_area", 0)
-        adv_area = listing.get("area", 0)
-        
-        if official_area == 0:
-            return f"- **Status:** ⚠️ No matching object found in Cadastre for address."
-            
-        diff = adv_area - official_area
-        percent = (diff / official_area) * 100 if official_area > 0 else 0
-        
-        verdict = "✅ Matches"
-        if percent > 20: verdict = "🔴 **SIGNIFICANT INFLATION**"
-        elif percent > 10: verdict = "🟡 Moderate Discrepancy"
+        heating = ai.get("heating_inventory", {})
+        heating_line = f"- **Infrastructure Check:** Detected {heating.get('ac_units')} ACs and {heating.get('radiators')} Radiators."
         
         return f"""
-- **Official Cadastre Area:** {official_area} sq.m
-- **Advertised Area:** {adv_area} sq.m
-- **Discrepancy:** {diff:+.1f} sq.m ({percent:+.1f}%) -> {verdict}
-- **Cadastre ID:** {cadastre.get("cadastre_id", "Unknown")}
+{neighborhood_line}
+- **Landmarks Identified:** {', '.join(ai.get('landmarks', ['None']))}
+{heating_line}
+- **Observed Orientation:** {ai.get('light_exposure')}
+- **Building Era:** {ai.get('building_type')}
         """
 
-    def _legal_section(self, ai, risk):
-        # Merge the old "Legal Engine" text here
-        text = []
-        if ai.get("is_atelier"):
-            text.append("- **Classification:** ⚠️ ATELIER (Not a legal apartment). Issues with address registration expected.")
-        else:
-            text.append("- **Classification:** ✅ Residential Apartment.")
-            
-        if "construction" in risk.get("pillars", {}):
-            score = risk["pillars"]["construction"]
-            if score > 0: text.append(f"- **Construction Maturity:** ⚠️ Potential 'Eternal Act 15' risk detected.")
-            
-        return "\n".join(text)
+    def _compliance_section(self, comp, risk):
+        act16 = "✅ Found" if comp.get("has_act16") else "⚠️ Missing/Not Digitized"
+        expr = "✅ Clear" if not risk.get("is_expropriated") else "🔴 EXPROPRIATED"
+        return f"- **Commissioning Certificate (Act 16):** {act16}\n- **Expropriation Risk:** {expr}"
+
+    def _cadastre_section(self, listing, cad):
+        off = cad.get("official_area", 0)
+        adv = listing.get("area_sqm", 0)
+        diff = float(adv) - float(off)
+        return f"- **Official Area:** {off} m2\n- **Advertised Area:** {adv} m2\n- **Difference:** {diff:+.1f} m2"
 
 
 =========================================
@@ -1559,141 +1527,156 @@ celery_app.autodiscover_tasks(['src.tasks'])
 FILE: ./src/tasks.py
 =========================================
 from asgiref.sync import async_to_sync
+import asyncio
+import httpx
 from src.worker import celery_app
 from src.db.session import SessionLocal
-from src.db.models import Listing, Report, ReportStatus
+from src.db.models import Listing, Report, ReportStatus, Building
 from src.services.scraper_service import ScraperService
 from src.services.ai_engine import GeminiService
 from src.services.storage_service import StorageService
-from src.services.repository import RealEstateRepository
+from src.services.geospatial_service import GeospatialService
 from src.services.cadastre_service import CadastreService
 from src.services.compliance_service import ComplianceService
 from src.services.city_risk_service import CityRiskService
 from src.services.risk_engine import RiskEngine
-from src.services.legal_engine import LegalEngine
 from src.services.report_generator import AttorneyReportGenerator
-from src.core.utils import calculate_content_hash
 from src.core.config import settings
-from src.schemas import ScrapedListing, AIAnalysisResult, RegistryCheck
 from src.core.logger import logger
-import asyncio
-import httpx
+from src.core.utils import normalize_sofia_street
 
-@celery_app.task(name="src.tasks.audit_listing", bind=True, 
-                 autoretry_for=(Exception,), 
-                 retry_backoff=True, max_retries=3)
-def audit_listing_task(self, listing_id: int):
+@celery_app.task(name="src.tasks.audit_listing")
+def audit_listing_task(listing_id: int):
     return async_to_sync(run_audit_pipeline)(listing_id)
 
 async def run_audit_pipeline(listing_id: int):
     log = logger.bind(listing_id=listing_id)
-    log.info("audit_started_multimodal")
-
+    
     async with httpx.AsyncClient(timeout=30.0) as http_client:
         with SessionLocal() as db:
-            try:
-                # 1. Init Services
-                repo = RealEstateRepository(db)
-                scraper = ScraperService(client=http_client)
-                ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
-                storage = StorageService()
-                risk_engine = RiskEngine()
-                legal_engine = LegalEngine()
-                brief_gen = AttorneyReportGenerator()
+            listing = db.query(Listing).get(listing_id)
+            if not listing: return "Error: Listing not found"
 
-                listing = db.query(Listing).get(listing_id)
-                if not listing: return "Error: Listing not found"
-
-                # 2. Scrape Data
-                scraped_data: ScrapedListing = await scraper.scrape_url(listing.source_url)
-                
-                # 3. Archive Images FIRST (to enable Vision AI)
-                archived_paths = await storage.archive_images(listing_id, scraped_data.image_urls)
-                
-                # 4. Multimodal AI Analysis (The "Vision AI" Update)
-                ai_raw = await ai_engine.analyze_listing_multimodal(
-                    scraped_data.raw_text, 
-                    archived_paths
-                )
-                ai_data = AIAnalysisResult(**ai_raw)
-
-                # 5. Parallel Forensic Registry Striking
-                cadastre = CadastreService(client=http_client)
+            # 1. SCRAPE
+            scraper = ScraperService(client=http_client)
+            scraped_data = await scraper.scrape_url(listing.source_url)
+            
+            # 2. VISION
+            storage = StorageService()
+            img_paths = await storage.archive_images(listing_id, scraped_data.image_urls)
+            ai_service = GeminiService(api_key=settings.GEMINI_API_KEY)
+            ai_data = await ai_service.analyze_listing_multimodal(scraped_data.raw_text, img_paths)
+            
+            # 3. GEO TRIANGULATION
+            geo_service = GeospatialService(api_key=settings.GOOGLE_MAPS_API_KEY)
+            geo_report = await geo_service.verify_neighborhood(
+                ai_data.get("address_prediction"), 
+                ai_data.get("landmarks", []), 
+                scraped_data.neighborhood
+            )
+            
+            # 4. REGISTRY (LINEAR)
+            cadastre = CadastreService(client=http_client)
+            best_address = normalize_sofia_street(geo_report.best_address or ai_data.get("address_prediction"))
+            cad_data = await cadastre.get_official_details(best_address)
+            
+            comp_raw = {"checked": False, "has_act16": False}
+            risk_raw = {"is_expropriated": False}
+            building_id = None
+            
+            if cad_data.cadastre_id:
+                # Parallel Municipal Strike
                 compliance = ComplianceService(client=http_client)
                 city_risk = CityRiskService(client=http_client)
-
-                cad_data, comp_raw, risk_raw = await asyncio.gather(
-                    cadastre.get_official_details(ai_data.address_prediction), 
-                    compliance.check_act_16(None), # Cadastre ID needed here for real prod
-                    city_risk.check_expropriation(None)
+                comp_raw, risk_raw = await asyncio.gather(
+                    compliance.check_act_16(cad_data.cadastre_id),
+                    city_risk.check_expropriation(cad_data.cadastre_id)
                 )
+                
+                # Persist Building Context
+                existing_building = db.query(Building).filter(Building.cadastre_id == cad_data.cadastre_id).first()
+                if not existing_building:
+                    new_building = Building(
+                        cadastre_id=cad_data.cadastre_id,
+                        address_full=cad_data.address_found or geo_report.best_address,
+                        latitude=geo_report.lat,
+                        longitude=geo_report.lng,
+                        construction_year=ai_data.get("construction_year_est")
+                    )
+                    db.add(new_building)
+                    db.flush()
+                    building_id = new_building.id
+                else:
+                    building_id = existing_building.id
 
-                # 6. Final Risk Scoring & Brief Generation
-                forensic_dict = {
-                    "scraped": scraped_data.model_dump(),
-                    "ai": ai_data.model_dump(),
-                    "cadastre": cad_data.model_dump(),
-                    "compliance": comp_raw,
-                    "city_risk": risk_raw
-                }
-                
-                score_res = risk_engine.calculate_score_v2(forensic_dict)
-                legal_res = legal_engine.analyze_listing(scraped_data.model_dump(), ai_data.model_dump())
-                final_score = max(score_res["score"], legal_res["total_legal_score"])
-                
-                report = Report(
-                    listing_id=listing_id,
-                    status=ReportStatus.VERIFIED if final_score < 40 else ReportStatus.MANUAL_REVIEW,
-                    risk_score=final_score,
-                    ai_confidence_score=ai_data.confidence_score,
-                    legal_brief=brief_gen.generate_legal_brief(scraped_data.model_dump(), {**score_res, "forensics": forensic_dict}, ai_data.model_dump()),
-                    discrepancy_details=forensic_dict,
-                    image_archive_urls=archived_paths
-                )
-                db.add(report)
-                db.commit()
-                
-                return f"Audit Complete: Score {final_score}"
-
-            except Exception as exc:
-                db.rollback()
-                log.exception("audit_pipeline_failed")
-                raise exc
+            # 5. SCORING
+            forensic_data = {
+                "scraped": scraped_data.model_dump(),
+                "ai": ai_data,
+                "geo": geo_report.model_dump(),
+                "cadastre": cad_data.model_dump(),
+                "compliance": comp_raw,
+                "city_risk": risk_raw
+            }
+            risk_engine = RiskEngine()
+            score_res = risk_engine.calculate_score_v2(forensic_data)
+            
+            # 6. REPORTING
+            report_gen = AttorneyReportGenerator()
+            report_text = report_gen.generate_legal_brief(scraped_data.model_dump(), {**score_res, "forensics": forensic_data}, ai_data)
+            
+            new_report = Report(
+                listing_id=listing_id,
+                building_id=building_id,
+                risk_score=score_res["score"],
+                legal_brief=report_text,
+                discrepancy_details=forensic_data,
+                status=ReportStatus.VERIFIED if score_res["score"] < 40 else ReportStatus.MANUAL_REVIEW
+            )
+            db.add(new_report)
+            db.commit()
+            
+            return f"Audit Done: {score_res['score']}"
 
 
 =========================================
 FILE: ./src/schemas.py
 =========================================
-from pydantic import BaseModel, Field, condecimal
+from pydantic import BaseModel, Field
 from decimal import Decimal
 from typing import List, Optional, Literal
 
 class ScrapedListing(BaseModel):
     source_url: str
     raw_text: str
-    price_predicted: condecimal(max_digits=12, decimal_places=2) 
-    
-    # PRECISION FIX: Area is now strictly Decimal
-    area_sqm: condecimal(max_digits=10, decimal_places=2)
-    
+    price_predicted: Decimal
+    area_sqm: Decimal
+    neighborhood: str 
     image_urls: List[str] = []
-    
-    class Config:
-        json_encoders = {Decimal: str}
+
+class HeatingInventory(BaseModel):
+    ac_units: int = 0
+    radiators: int = 0
+    has_central_heating: bool = False
 
 class AIAnalysisResult(BaseModel):
     address_prediction: str
-    neighborhood: str
-    is_atelier: bool
-    net_living_area: float
-    construction_year: int
+    landmarks: List[str] = []
+    neighborhood_match: str
+    building_type: str
+    heating_inventory: HeatingInventory
+    visual_red_flags: List[str] = []
+    light_exposure: str
     confidence_score: int = Field(default=0, ge=0, le=100)
 
-class RegistryCheck(BaseModel):
-    registry_status: Literal["LIVE", "OFFLINE", "ERROR"] = "LIVE"
-    details: str = ""
-    is_risk_detected: bool = False
-    checked: bool = False
+class GeoVerification(BaseModel):
+    match: bool
+    detected_neighborhood: str
+    confidence: int
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    warning: Optional[str] = None
+    best_address: Optional[str] = None
 
 class CadastreData(BaseModel):
     official_area: float = 0.0
@@ -1737,26 +1720,34 @@ echo "Dump complete. Copy contents of $output"
 =========================================
 FILE: ./prompts/detective_prompt_v1.md
 =========================================
-# Role: Geospatial & Technical Detective
-Analyze the real estate listing. Focus on detecting hidden legal or maintenance risks.
+# Role: Senior Real Estate Forensic Detective (Sofia, BG)
+You are an expert in Sofia property forensics. Your goal is to cross-examine listing photos against the provided text to detect "Broker Lies" and legal risks.
 
-## Constraints
-1. **Atelier Check:** Look for "Atelier" in text or industrial/office elements in photos.
-2. **Heating:** Identify AC units, radiators, or fireplace.
-3. **Era:** Estimate if building is Pre-1989 (Panel/EPC) or Post-2000 (Brick).
-4. **Landmarks:** Identify specific street names or shop signs.
+## Forensic Tasks:
+1. **Landmark Geolocation (Triangulation):** 
+   - Search backgrounds for unique Sofia landmarks (Vitosha Mountain angle, TV Tower, NDK, Paradise Mall, etc.).
+   - Extract names of shops, metro stations, or street signs visible in the pixels or mentioned in text.
+2. **Object Localization (Inventory):** 
+   - Count visible AC units and heating radiators.
+   - Look for the 'TEC' (Central Heating) nodes or gas boilers.
+3. **Architectural Era Analysis:** Identify if the building is Pre-1989 (Panel/EPC) or Post-2000 (Brick) based on facade style and materials.
+4. **The Atelier Trap:** Identify "shop-style" glass, ground-floor placements, or lack of balconies which suggest non-residential status.
+5. **Orientation Check:** Compare the light levels. If "Sunny South" is claimed but shadows suggest North, flag it.
 
-## Output Format (JSON Only)
+## Output Format (JSON Only):
 {
-  "address_prediction": "String",
-  "confidence": 0-100,
-  "is_atelier": boolean,
-  "reasoning_steps": ["Step 1", "Step 2"],
-  "vision_insights": {
-    "facade_era": "string",
-    "heating_source": "electricity/gas/central",
-    "floor_plan_suspicion": "high/low"
-  }
+  "address_prediction": "Specific street or clue",
+  "landmarks": ["Name of shop/landmark found"],
+  "neighborhood_match": "Confident/Suspicious/Inconsistent",
+  "building_type": "Panel / Brick / EPC / New Construction",
+  "heating_inventory": {
+    "ac_units": 0,
+    "radiators": 0,
+    "has_central_heating": boolean
+  },
+  "visual_red_flags": ["List specific discrepancies"],
+  "light_exposure": "North/South/East/West",
+  "confidence_score": 0-100
 }
 
 

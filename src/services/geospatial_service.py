@@ -1,6 +1,7 @@
 import httpx
 from src.core.logger import logger
 from src.schemas import GeoVerification
+from typing import Optional
 
 class GeospatialService:
     def __init__(self, api_key: str):
@@ -11,7 +12,7 @@ class GeospatialService:
         if self.api_key == "mock-key":
             return GeoVerification(match=True, detected_neighborhood="Mock", confidence=100)
 
-        # Build a search query from Gemini's clues
+        # Build a search query prioritizing specific clues from Gemini
         search_query = f"{ai_prediction} {' '.join(ai_landmarks)}, Sofia, Bulgaria"
         
         async with httpx.AsyncClient() as client:
@@ -23,18 +24,20 @@ class GeospatialService:
 
             result = data["results"][0]
             lat_lng = result["geometry"]["location"]
+            formatted_address = result.get("formatted_address", "")
             
-            # Extract neighborhood (sublocality)
+            # Extract neighborhood from Google components
             detected = ""
             for comp in result["address_components"]:
-                if "sublocality" in comp["types"] or "neighborhood" in comp["types"]:
+                if any(t in comp["types"] for t in ["sublocality", "neighborhood", "political"]):
                     detected = comp["long_name"]
                     break
             
             # Cross-reference
-            claimed_norm = claimed_kvartal.lower().strip()
-            detected_norm = detected.lower()
+            claimed_norm = claimed_kvartal.lower().replace("гр.", "").strip()
+            detected_norm = detected.lower().strip()
             
+            # Match if strings overlap (e.g., "Krastova Vada" vs "Manastirski Livadi - East")
             is_match = claimed_norm in detected_norm or detected_norm in claimed_norm
             
             return GeoVerification(
@@ -43,5 +46,6 @@ class GeospatialService:
                 confidence=90,
                 lat=lat_lng["lat"],
                 lng=lat_lng["lng"],
-                warning=None if is_match else f"Location Alert: Ad says {claimed_kvartal}, but View/Landmarks suggest {detected}."
+                warning=None if is_match else f"LOCATION FRAUD: Ad claims {claimed_kvartal}, but Vision/Maps identifies {detected}.",
+                best_address=formatted_address
             )
