@@ -1,31 +1,107 @@
-from typing import Optional, Dict
+import logging
+import asyncio
+import re
+from typing import Optional, Dict, Any
+import httpx
+from bs4 import BeautifulSoup
+
+logger = logging.getLogger("cadastre_intel")
 
 class CadastreService:
     """
     Interface for the Official Property Registry (Cadastre).
-    In a real deployment, this would use the official API or a headless browser.
+    Uses direct internal API calls to bypass standard UI friction.
     """
-    def __init__(self):
-        # In the future, API keys for the government portal go here
-        pass
+    BASE_URL = "https://kais.cadastre.bg/bg/Map"
+    HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/118.0',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': 'https://kais.cadastre.bg/bg/Map',
+        'Origin': 'https://kais.cadastre.bg'
+    }
 
-    def fetch_details(self, address: str) -> Optional[Dict[str, float]]:
+    async def get_official_details(self, address: str) -> Optional[Dict[str, Any]]:
         """
-        Simulates a lookup in the national registry.
-        Returns: { "official_area": 85.0, "year_built": 2005 }
+        Orchestrates the search: Address -> Cadastral ID -> Property Details.
         """
-        print(f"[CADASTRE] Querying registry for: {address}")
-        
-        # MOCK LOGIC: 
-        # For now, we return 'None' to simulate that most addresses 
-        # cannot be perfectly matched automatically yet.
-        # This prevents the Risk Engine from throwing false positives 
-        # until the real integration is ready.
-        
-        return None 
-        
-        # EXAMPLE REAL IMPLEMENTATION STUB:
-        # response = requests.get(f"https://kais.cadastre.bg/api/search?q={address}")
-        # if response.status_code == 200:
-        #     return response.json()
-        # return None
+        async with httpx.AsyncClient(headers=self.HEADERS, timeout=15.0, verify=False) as client:
+            try:
+                # 1. Resolve Address to Identifier
+                identifier = await self._resolve_address_to_id(client, address)
+                if not identifier:
+                    logger.warning(f"Cadastre resolution failed for: {address}")
+                    return None
+
+                # 2. Fetch Details using Identifier
+                details = await self._fetch_property_data(client, identifier)
+                return details
+
+            except Exception as e:
+                logger.error(f"Cadastre lookup error: {e}")
+                return None
+
+    async def _resolve_address_to_id(self, client: httpx.AsyncClient, address: str) -> Optional[str]:
+        try:
+            # A. Initialize Session (CSRF Token)
+            page = await client.get(self.BASE_URL)
+            soup = BeautifulSoup(page.text, 'html.parser')
+            token_input = soup.find('input', {'name': '__RequestVerificationToken'})
+            if not token_input: return None
+            csrf_token = token_input.get('value')
+
+            # B. Execute Search
+            await client.get(f"{self.BASE_URL}/FastSearch", params={'KeyWords': address})
+            await asyncio.sleep(0.5)
+
+            # C. Retrieve Results
+            read_headers = {**self.HEADERS, 'X-CSRF-TOKEN': csrf_token}
+            res = await client.post(
+                f"{self.BASE_URL}/ReadFoundObjects", 
+                data={'page': 1, 'pageSize': 5}, 
+                headers=read_headers
+            )
+            
+            data = res.json()
+            if data.get('Data'):
+                return data['Data'][0].get('Number') # Return first match
+            return None
+        except:
+            return None
+
+    async def _fetch_property_data(self, client: httpx.AsyncClient, identifier: str) -> Dict[str, Any]:
+        try:
+            # Re-init session for object lookup
+            page = await client.get(self.BASE_URL)
+            soup = BeautifulSoup(page.text, 'html.parser')
+            csrf_token = soup.find('input', {'name': '__RequestVerificationToken'})['value']
+
+            await client.get(f"{self.BASE_URL}/FastSearch", params={'KeyWords': identifier})
+            await asyncio.sleep(0.2)
+
+            read_headers = {**self.HEADERS, 'X-CSRF-TOKEN': csrf_token}
+            res = await client.post(
+                f"{self.BASE_URL}/ReadFoundObjects", 
+                data={'page': 1, 'pageSize': 1}, 
+                headers=read_headers
+            )
+            json_data = res.json()
+            
+            if not json_data.get('Data'):
+                return {"official_area": 0.0, "type": "Unknown", "cadastre_id": identifier}
+
+            object_params = json_data['Data'][0]
+            info_res = await client.get(f"{self.BASE_URL}/GetObjectInfo", params=object_params)
+            
+            info_soup = BeautifulSoup(info_res.text, 'html.parser')
+            raw_text = info_soup.get_text(" ", strip=True)
+
+            area_match = re.search(r"площ(?:\s*по\s*документ)?\s*([\d\.]+)", raw_text, re.IGNORECASE)
+            area = float(area_match.group(1)) if area_match else 0.0
+            
+            return {
+                "cadastre_id": identifier,
+                "official_area": area,
+                "raw_registry_text": raw_text[:300]
+            }
+        except:
+            return {"official_area": 0.0, "cadastre_id": identifier, "error": "Parse Fail"}
