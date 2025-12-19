@@ -27,7 +27,6 @@ def audit_listing_task(self, listing_id: int):
             brief_gen = AttorneyReportGenerator()
             risk_engine = RiskEngine()
             
-            # New Services
             cadastre = CadastreService()
             compliance = ComplianceService()
             city_risk = CityRiskService()
@@ -35,29 +34,23 @@ def audit_listing_task(self, listing_id: int):
             listing = db.query(Listing).get(listing_id)
             if not listing: return "Error: Listing not found"
 
-            # 1. Scrape Text/Images
+            # 1. Scrape
             scraped_data = scraper.scrape_url(listing.source_url)
             
-            # 2. ASYNC PARALLEL EXECUTION (The "Brain")
+            # 2. Async Forensics
             async def run_forensics():
-                # A. Run AI Analysis (Address Extraction)
                 ai_res = await ai_engine.analyze_text(scraped_data["raw_text"])
                 address_pred = ai_res.get("address_prediction", "")
                 
-                # B. Run Cadastre Lookup (needs address from AI, so we await AI first in this flow, or rely on scraper)
-                # Optimization: If AI is fast, we chain it. 
                 cad_res = await cadastre.get_official_details(address_pred) if address_pred else None
                 cad_id = cad_res.get("cadastre_id") if cad_res else None
                 
-                # C. Run Parallel Checks if ID found
                 tasks = [storage.archive_images(listing_id, scraped_data["image_urls"])]
-                
                 comp_task = compliance.check_act_16(cad_id)
                 risk_task = city_risk.check_expropriation(cad_id)
                 
                 results = await asyncio.gather(tasks[0], comp_task, risk_task)
-                
-                return ai_res, cad_res, results[1], results[2], results[0] # ai, cad, comp, risk, imgs
+                return ai_res, cad_res, results[1], results[2], results[0]
 
             ai_data, cad_data, comp_data, risk_data, archived_paths = asyncio.run(run_forensics())
 
@@ -65,7 +58,7 @@ def audit_listing_task(self, listing_id: int):
             chash = calculate_content_hash(scraped_data["raw_text"], scraped_data["price_predicted"])
             repo.update_listing_data(listing_id, scraped_data["price_predicted"], scraped_data["area"], scraped_data["raw_text"], chash)
 
-            # 4. Consolidate Risk Data
+            # 4. Consolidate & Score
             forensic_data = {
                 "scraped": scraped_data,
                 "ai": ai_data,
@@ -74,27 +67,30 @@ def audit_listing_task(self, listing_id: int):
                 "city_risk": risk_data
             }
 
-            # 5. Calculate Score
             score_res = risk_engine.calculate_score_v2(forensic_data)
-            legal_res = legal_engine.analyze_listing(scraped_data, ai_data) # Legacy method, keep for now or merge
+            legal_res = legal_engine.analyze_listing(scraped_data, ai_data)
             
-            # Merge scores (Forensic overrides Legal if critical)
+            # MERGE DATA FOR LAWYER
+            # This is the key fix: We pass everything to the generator
+            consolidated_risk = {**legal_res, **score_res, "forensics": forensic_data}
+            
             final_score = max(score_res["score"], legal_res["total_legal_score"])
             
-            brief = brief_gen.generate_legal_brief(scraped_data, legal_res, ai_data)
+            # Generate Brief
+            brief = brief_gen.generate_legal_brief(scraped_data, consolidated_risk, ai_data)
             
             status = ReportStatus.VERIFIED if final_score < 40 else ReportStatus.MANUAL_REVIEW
             if score_res.get("is_fatal") or legal_res.get("gatekeeper_verdict") == "ABORT":
                 status = ReportStatus.REJECTED
 
-            # 6. Save Report
+            # 5. Save
             report = Report(
                 listing_id=listing_id,
                 status=status,
                 risk_score=final_score,
                 ai_confidence_score=ai_data.get("confidence", 0),
                 legal_brief=brief,
-                discrepancy_details={**legal_res, **score_res, "cadastre": cad_data},
+                discrepancy_details=consolidated_risk,
                 image_archive_urls=archived_paths,
                 cost_to_generate=0.04
             )
