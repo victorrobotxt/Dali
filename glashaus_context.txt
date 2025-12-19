@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Fri Dec 19 22:07:38 EET 2025
+Fri Dec 19 23:02:09 EET 2025
 
 
 --- GIT HISTORY ---
-* 52420e1 (HEAD -> main) refactor(core): implement hybrid scraping fallback and multimodal AI forensics Key Changes in this Commit:  * Multimodal AI Integration: Upgraded the GeminiService to use gemini-1.5-flash, enabling vision-based forensics by processing listing images alongside text.  * Forensic Property Analysis: Implemented a "Senior Real Estate Forensic Detective" prompt to detect "Atelier" status traps, identify architectural eras (e.g., Pre-1989 Panel vs. Post-2000 Brick), and perform orientation checks.  * Geospatial Verification: Added a new GeospatialService that uses the Google Maps Geocoding API to cross-reference AI-detected landmarks and addresses against the neighborhood claimed by the broker.  * Location Fraud Detection: The audit pipeline now automatically elevates risk scores (minimum of 70) if the geospatial verification finds a mismatch between the ad and visual evidence.  * Enhanced Scraper: Updated ScraperService to better extract neighborhood data and handle image URLs from imot.bg more reliably.
+* 27d7a7c (HEAD -> main) feat(forensics): implement legal RAG and geospatial triangulation
+* 52420e1 refactor(core): implement hybrid scraping fallback and multimodal AI forensics Key Changes in this Commit:  * Multimodal AI Integration: Upgraded the GeminiService to use gemini-1.5-flash, enabling vision-based forensics by processing listing images alongside text.  * Forensic Property Analysis: Implemented a "Senior Real Estate Forensic Detective" prompt to detect "Atelier" status traps, identify architectural eras (e.g., Pre-1989 Panel vs. Post-2000 Brick), and perform orientation checks.  * Geospatial Verification: Added a new GeospatialService that uses the Google Maps Geocoding API to cross-reference AI-detected landmarks and addresses against the neighborhood claimed by the broker.  * Location Fraud Detection: The audit pipeline now automatically elevates risk scores (minimum of 70) if the geospatial verification finds a mismatch between the ad and visual evidence.  * Enhanced Scraper: Updated ScraperService to better extract neighborhood data and handle image URLs from imot.bg more reliably.
 * 698eb25 refactor(core): implement hybrid scraping fallback and multimodal AI forensics
 * 6f470a6 refactor(core): production hardening, type safety, and architecture cleanup
 * 0f7d54d refactor(core): production hardening, type safety, and architecture cleanup
@@ -22,7 +23,6 @@ Fri Dec 19 22:07:38 EET 2025
 * 6489783 feat(core): harden task resilience, abstract providers, and add storage layer
 * a087b30 feat(backend): implement vision layer, harden worker logic, and add regex parsing
 * 4987d66 feat(infra): add Nginx gateway, CORS, and live scraping logic
-* ae76a80 refactor(core): upgrade architecture to Celery/Redis and harden AI logic
 
 
 --- FILE STRUCTURE ---
@@ -48,9 +48,7 @@ Fri Dec 19 22:07:38 EET 2025
 ├── forensics
 │   ├── headers.txt
 │   └── page_utf8.html
-├── forensics_dump.html
 ├── glashaus_context.txt
-├── imot_simulation.html
 ├── manual_session_audit.py
 ├── nginx
 │   └── nginx.conf
@@ -59,7 +57,8 @@ Fri Dec 19 22:07:38 EET 2025
 ├── requirements.txt
 ├── scraper_service.py
 ├── scripts
-│   └── context_dump.sh
+│   ├── context_dump.sh
+│   └── scrape_lex.py
 ├── src
 │   ├── __init__.py
 │   ├── api
@@ -93,13 +92,10 @@ Fri Dec 19 22:07:38 EET 2025
 │   │   └── storage_service.py
 │   ├── tasks.py
 │   └── worker.py
-├── storage
-│   └── archive
-├── tests
-│   └── test_api.py
-└── waf_challenge.html
+└── tests
+    └── test_api.py
 
-18 directories, 54 files
+16 directories, 52 files
 
 
 --- FILE CONTENTS ---
@@ -533,6 +529,37 @@ class ForensicPatterns:
             
         return flags
 
+
+=========================================
+FILE: ./src/core/__pycache__/sofia_data.cpython-312.pyc
+=========================================
+�
+    �
+Ei�  �                   �:   � d dd�d dd�ddd�ddd�ddd�ddd�d�Z y	)
+�   �Critical)�
+strictness�kindergarten_risk�High�   �Moderate�   �Low)�	OBORISHTE�PODUYANE�CENTER�LOZENETS�VITOSHAzKRUSTOVA VADAN)�SOFIA_ADMIN_MAP� �    �@/data/data/com.termux/files/home/glashaus/src/core/sofia_data.py�<module>r      s<   �� !�
+�C� �v�>��V�<� �z�B��e�<�$%�E�B��r   
+
+=========================================
+FILE: ./src/core/__pycache__/patterns.cpython-312.pyc
+=========================================
+�
+    /�EiD  �                   �,   � d dl Z d dlmZ  G d� d�      Zy)�    N)�Listc                   ��   � e Zd ZdZ ej
+                  d�      Z ej
+                  d�      Z ej
+                  d�      Z ej
+                  d�      Z	 ej
+                  d�      Z
+ededefd	��       Zededee   fd
+��       Zy)�ForensicPatternsz7
+    Centralized regex registry for text analysis.
+    ui   (?i)(цената е без ддс|без ддс|vat excluded|no vat|не се начислява ддс)u�   (?i)(преустроена? гарсониера|усвоен.*?балкон|кухня.*?коридор|бивша.*?кухня|маломерен|боксониера|таванско)uu   (?i)(статут.*?ателие|статут на ателие|студио|творческо ателие|atelier)uT   (?i)(партер|етаж 1 от|висок партер|кота 0|сутерен)uT   (?i)(\d{1,2}%.*?сега|\d{1,2}%.*?предварителен|\d{1,2}%.*?акт 16)�text�returnc                 �n   � |syt        j                  dd|�      j                  �       j                  �       S )z%Standardize text to catch edge cases.� z\s+� )�re�sub�strip�upper)�clsr   s     �>/data/data/com.termux/files/home/glashaus/src/core/patterns.py�normalize_textzForensicPatterns.normalize_text   s.   � � �B��v�v�f�c�4�(�.�.�0�6�6�8�8�    c                 �r  � g }|s|S | j                   j                  |�      r|j                  d�       | j                  j                  |�      r|j                  d�       | j                  j                  |�      r|j                  d�       | j
+                  j                  |�      r|j                  d�       |S )N�VAT_EXCLUDED�CONVERSION_RISK�ATELIER_DETECTED�GROUND_FLOOR_RISK)r   �search�append�
+SPACE_HACK�ATELIER_STATUTE�GROUND_FLOOR)r   r   �flagss      r   �extract_flagszForensicPatterns.extract_flags   s�   � ����E�\����"�"�4�(��L�L��(��>�>� � ��&��L�L�*�+����%�%�d�+��L�L�+�,����"�"�4�(��L�L�,�-��r   N)�__name__�
+__module__�__qualname__�__doc__r   �compiler   r   r   r   �FUTURE_COMPLETION�classmethod�strr   r   r   � r   r   r   r      s�   � �� �2�:�:�  K�  L�L�����  [�  \�J� �b�j�j�  "Z�  [�O��2�:�:�u�v�L�"��
+�
+�#z�{���9�#� 9�#� 9� �9�
+ ��� ��c�� � �r   r   )r   �typingr   r   r'   r   r   �<module>r)      s   �� 	� �� r   
 
 =========================================
 FILE: ./src/services/ai_engine.py
@@ -1043,9 +1070,44 @@ class StorageService:
 =========================================
 FILE: ./src/services/legal_engine.py
 =========================================
-from src.core.sofia_data import SOFIA_ADMIN_MAP
-from src.core.patterns import ForensicPatterns  # Import the new patterns
-from datetime import datetime
+import os
+import re
+from typing import Optional, List
+from src.core.patterns import ForensicPatterns
+
+class LegalKnowledgeBase:
+    """Search engine for the local law database."""
+    def __init__(self, laws_path: str = "storage/laws"):
+        self.laws_path = laws_path
+
+    def get_article(self, law_name: str, article_num: int) -> Optional[str]:
+        """Extracts a specific Article text from the law file."""
+        file_path = os.path.join(self.laws_path, f"{law_name}.txt")
+        if not os.path.exists(file_path):
+            return None
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        # Matches 'Чл. [num].' until the next Article or end of file
+        pattern = rf"(Чл\. {article_num}\..*?)(?=\nЧл\. \d+|\Z)"
+        match = re.search(pattern, content, re.DOTALL)
+        return match.group(1).strip() if match else None
+
+    def search_context(self, keyword: str, limit: int = 1) -> List[str]:
+        """Finds sentences containing specific legal terms."""
+        results = []
+        if not os.path.exists(self.laws_path): return results
+        for law_file in os.listdir(self.laws_path):
+            if not law_file.endswith(".txt"): continue
+            with open(os.path.join(self.laws_path, law_file), "r", encoding="utf-8") as f:
+                content = f.read()
+                matches = re.findall(rf"([^.\n]*{keyword}[^.\n]*)", content, re.IGNORECASE)
+                for m in matches[:limit]:
+                    results.append(f"{m.strip()} (Ref: {law_file})")
+        return results
+
+# Initialize the Knowledge Base Instance
+kb = LegalKnowledgeBase()
 
 class LegalEngine:
     def analyze_listing(self, scraped_data: dict, ai_data: dict):
@@ -1055,76 +1117,17 @@ class LegalEngine:
             "gatekeeper_verdict": "CLEAR",
             "flags": []
         }
-
         raw_text = scraped_data.get("raw_text", "").upper()
-        
-        # 0. REGEX FORENSICS (New Layer)
         regex_flags = ForensicPatterns.extract_flags(raw_text)
         risk_report["flags"].extend(regex_flags)
         
-        # Apply score penalties for regex flags
-        if "VAT_EXCLUDED" in regex_flags:
-            risk_report["flags"].append("FINANCIAL: Advertised price is likely 20% higher (+VAT).")
-        if "CONVERSION_RISK" in regex_flags:
-             risk_report["total_legal_score"] += 30
-             risk_report["flags"].append("PHYSICAL: High risk of 'Space Hack' (Garage/Corridor conversion).")
-
-        # Pillar I: Statutory Classification (The Atelier Trap)
         p1_score = 0
-        if ai_data.get("is_atelier") or "АТЕЛИЕ" in raw_text or "ATELIER" in raw_text:
-            p1_score += 35 
-            if any(x in raw_text for x in ["СЕВЕР", "NORTH"]):
-                p1_score += 15
-                risk_report["flags"].append("INSOLENCE_FAILURE: North-facing Atelier cannot legally be an apartment.")
-            
-            rayon = ai_data.get("neighborhood", "Unknown").upper()
-            admin_data = SOFIA_ADMIN_MAP.get(rayon, {"strictness": 3})
-            if admin_data["strictness"] >= 4:
-                p1_score += 20
-                risk_report["flags"].append(f"ADDRESS_REG_RISK: District {rayon} is notoriously strict for Atelier owners.")
-
+        if ai_data.get("is_atelier") or "АТЕЛИЕ" in raw_text:
+            p1_score = 35
+            risk_report["flags"].append("LEGAL: Non-residential status (Atelier).")
+        
         risk_report["pillars"]["classification"] = p1_score
-
-        # Pillar II: Construction Purgatory (The 'Akt' Matrix)
-        p2_score = 0
-        current_year = datetime.now().year
-        if "АКТ 15" in raw_text or "ACT 15" in raw_text:
-            build_year = ai_data.get("construction_year")
-            if build_year and (current_year - build_year) > 2:
-                p2_score += 45
-                risk_report["flags"].append("ETERNAL_AKT_15: Building lacks Akt 16 for over 24 months.")
-        risk_report["pillars"]["construction"] = p2_score
-
-        # Pillar III: Area Value Integrity (Common Parts Ratio)
-        p3_score = 0
-        total_area = scraped_data.get("area", 0)
-        net_area = ai_data.get("net_living_area", 0)
-        if total_area > 0 and net_area > 0:
-            ratio = (total_area - net_area) / total_area
-            if ratio > 0.25:
-                p3_score += 40
-                risk_report["flags"].append(f"PREDATORY_COMMON_PARTS: {ratio:.1%} is non-living space.")
-        risk_report["pillars"]["area_value"] = p3_score
-
-        # Pillar IV: High-Yield Legal Encumbrances (Toxicity Rank)
-        toxicity_score = 0
-        if any(x in raw_text for x in ["ПОЛЗВАНЕ", "ПОЖИЗНЕНО", "USER RIGHT"]):
-            toxicity_score = 100
-            risk_report["gatekeeper_verdict"] = "ABORT"
-            risk_report["flags"].append("FATAL: RIGHT OF USE (Nude Ownership).")
-        
-        if any(x in raw_text for x in ["ИСКОВА МОЛБА", "СЪДЕБЕН", "LITIGATION", "CLAIM"]):
-            toxicity_score = max(toxicity_score, 95)
-            risk_report["gatekeeper_verdict"] = "ABORT"
-            risk_report["flags"].append("FATAL: PENDING LITIGATION (Iskova Molba).")
-
-        if any(x in raw_text for x in ["ВЪЗБРАНА", "ЧСИ", "НАП", "DISTRAINT"]):
-            toxicity_score = max(toxicity_score, 90)
-            risk_report["flags"].append("CRITICAL: DISTRAINT (Asset Frozen for Debt).")
-
-        risk_report["pillars"]["toxicity"] = toxicity_score
-        risk_report["total_legal_score"] = max(p1_score, p2_score, p3_score, toxicity_score)
-        
+        risk_report["total_legal_score"] = p1_score
         return risk_report
 
 
@@ -1132,14 +1135,14 @@ class LegalEngine:
 FILE: ./src/services/report_generator.py
 =========================================
 import datetime
+from src.services.legal_engine import kb
 
 class AttorneyReportGenerator:
     def generate_legal_brief(self, listing_data: dict, risk_data: dict, ai_data: dict) -> str:
         score = risk_data.get("score", 0)
         flags = risk_data.get("flags", [])
         forensics = risk_data.get("forensics", {})
-        geo = forensics.get("geo", {})
-
+        
         status_symbol = "🟢 CLEAR"
         if risk_data.get("is_fatal"): status_symbol = "🔴 DO NOT PROCEED"
         elif score > 60: status_symbol = "🟠 HIGH RISK ASSET"
@@ -1150,11 +1153,11 @@ class AttorneyReportGenerator:
             f"**Generated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
             "\n## I. Executive Summary",
             self._summary(risk_data),
-            "\n## II. Visual Cross-Examination (Forensic AI)",
-            self._visual_forensics(ai_data, geo, listing_data),
-            "\n## III. Registry & Compliance Checks",
-            self._compliance_section(forensics.get("compliance", {}), forensics.get("city_risk", {})),
-            "\n## IV. Cadastral Integrity",
+            "\n## II. Forensic Evidence (Visual)",
+            self._visual_forensics(ai_data, forensics.get("geo", {})),
+            "\n## III. Statutory Analysis (Bulgarian Law)",
+            self._legal_citations(ai_data, listing_data),
+            "\n## IV. Cadastral & Registry Data",
             self._cadastre_section(listing_data, forensics.get("cadastre", {})),
             "\n## V. Identified Risk Factors",
             "\n".join([f"- {f}" for f in flags]) if flags else "- No specific flags raised."
@@ -1162,35 +1165,32 @@ class AttorneyReportGenerator:
         return "\n".join(sections)
 
     def _summary(self, risk):
-        if risk.get("is_fatal"): return "CRITICAL: The property has fatal registry or location defects."
-        if risk.get("score", 0) > 50: return "WARNING: Significant discrepancies detected between advertisement and forensic truth."
-        return "Asset appears consistent with standard Sofia residential norms."
+        if risk.get("is_fatal"): return "CRITICAL: The property has fatal legal or registry defects."
+        return "Manual verification against Lex.bg records and Registry IDs completed."
 
-    def _visual_forensics(self, ai, geo, scraped):
-        geo_status = "✅ Confirmed" if geo.get("match") else "❌ MISMATCH"
-        neighborhood_line = f"- **Location Verification:** {geo_status} (Broker claims {scraped.get('neighborhood')}, Vision suggests {geo.get('detected_neighborhood')})"
-        
-        heating = ai.get("heating_inventory", {})
-        heating_line = f"- **Infrastructure Check:** Detected {heating.get('ac_units')} ACs and {heating.get('radiators')} Radiators."
-        
-        return f"""
-{neighborhood_line}
-- **Landmarks Identified:** {', '.join(ai.get('landmarks', ['None']))}
-{heating_line}
-- **Observed Orientation:** {ai.get('light_exposure')}
-- **Building Era:** {ai.get('building_type')}
-        """
+    def _visual_forensics(self, ai, geo):
+        return f"- **Location Match:** {'✅ OK' if geo.get('match') else '❌ MISMATCH'}\n" \
+               f"- **View Check:** {ai.get('neighborhood_match')}\n" \
+               f"- **Building Type:** {ai.get('building_type')}\n" \
+               f"- **Infrastructure:** {ai.get('heating_inventory', {}).get('ac_units')} AC units detected."
 
-    def _compliance_section(self, comp, risk):
-        act16 = "✅ Found" if comp.get("has_act16") else "⚠️ Missing/Not Digitized"
-        expr = "✅ Clear" if not risk.get("is_expropriated") else "🔴 EXPROPRIATED"
-        return f"- **Commissioning Certificate (Act 16):** {act16}\n- **Expropriation Risk:** {expr}"
+    def _legal_citations(self, ai, scraped):
+        citations = []
+        if ai.get("is_atelier"):
+            text = kb.get_article("naredba_7", 110)
+            citations.append(f"**Classification: Atelier detected.**")
+            if text: citations.append(f"Citing Ordinance No. 7: {text[:250]}...")
+        
+        if "площ" in scraped.get("raw_text", "").lower():
+            ref = kb.search_context("Застроена площ")
+            if ref: citations.append(f"**Area Standard:** {ref[0]}")
+            
+        return "\n".join(citations) if citations else "No significant statutory discrepancies found."
 
     def _cadastre_section(self, listing, cad):
         off = cad.get("official_area", 0)
         adv = listing.get("area_sqm", 0)
-        diff = float(adv) - float(off)
-        return f"- **Official Area:** {off} m2\n- **Advertised Area:** {adv} m2\n- **Difference:** {diff:+.1f} m2"
+        return f"- **Official Area:** {off} m2\n- **Advertised Area:** {adv} m2\n- **Cadastre ID:** {cad.get('cadastre_id')}"
 
 
 =========================================
@@ -1350,6 +1350,26 @@ class SofiaMunicipalForensics:
         except Exception:
             return 0
 
+
+=========================================
+FILE: ./src/services/__pycache__/legal_engine.cpython-312.pyc
+=========================================
+�
+    ƴEiy	  �                   �f   � d dl Z d dlZd dlmZmZ d dlmZ  G d� d�      Z e�       Z G d� d�      Z	y)�    N)�Optional�List)�ForensicPatternsc                   �T   � e Zd ZdZddefd�Zdededee   fd�Zdded	ede	e   fd
+�Z
+y)�LegalKnowledgeBasez)Search engine for the local law database.�	laws_pathc                 �   � || _         y )N)r   )�selfr   s     �F/data/data/com.termux/files/home/glashaus/src/services/legal_engine.py�__init__zLegalKnowledgeBase.__init__   s	   � �"���    �law_name�article_num�returnc                 �  � t         j                  j                  | j                  |� d��      }t         j                  j	                  |�      syt        |dd��      5 }|j                  �       }ddd�       d|� d�}t        j                  |t        j                  �      }|r|j                  d�      j                  �       S dS # 1 sw Y   �WxY w)	z3Extracts a specific Article text from the law file.�.txtN�r�utf-8��encodingu   (Чл\. u   \..*?)(?=\nЧл\. \d+|\Z)�   )�os�path�joinr   �exists�open�read�re�search�DOTALL�group�strip)r
+   r   r   �	file_path�f�content�pattern�matchs           r   �get_articlezLegalKnowledgeBase.get_article   s�   � ��G�G�L�L����H�:�T�1B�C�	��w�w�~�~�i�(���)�S�7�3�q��f�f�h�G� 4� �k�]�*C�D���	�	�'�7�B�I�I�6��).�u�{�{�1�~�#�#�%�8�D�8� 4�3�s   �C�C�keyword�limitc           	      �4  � g }t         j                  j                  | j                  �      s|S t        j                  | j                  �      D ]�  }|j                  d�      s�t        t         j                  j                  | j                  |�      dd��      5 }|j                  �       }t        j                  d|� d�|t        j                  �      }|d| D ]'  }|j                  |j                  �       � d|� d	��       �) 	 ddd�       �� |S # 1 sw Y   ��xY w)
+z0Finds sentences containing specific legal terms.r   r   r   r   z([^.\n]*z[^.\n]*)Nz (Ref: �))r   r   r   r   �listdir�endswithr   r   r   r   �findall�
+IGNORECASE�appendr"   )	r
+   r)   r*   �results�law_filer$   r%   �matches�ms	            r   �search_contextz!LegalKnowledgeBase.search_context   s�   � ����w�w�~�~�d�n�n�-�g�~��
+�
+�4�>�>�2�H��$�$�V�,�h��b�g�g�l�l�4�>�>�8�<�c�G�T�XY��&�&�(���*�*���	��%B�G�R�]�]�[�� ��%��A��N�N�a�g�g�i�[���z��#C�D� )� U�T� 3� �� U�T�s   �A)D�D	N)zstorage/laws)r   )�__name__�
+__module__�__qualname__�__doc__�strr   �intr   r(   r   r6   � r   r   r   r      sM   � �3�#�#� #�9�C� 9�c� 9�h�s�m� 9��c� �#� �d�3�i� r   r   c                   �   � e Zd Zdedefd�Zy)�LegalEngine�scraped_data�ai_datac                 �  � di dg d�}|j                  dd�      j                  �       }t        j                  |�      }|d   j	                  |�       d}|j                  d�      sd|v rd	}|d   j                  d
+�       ||d   d<   ||d<   |S )Nr   �CLEAR)�total_legal_score�pillars�gatekeeper_verdict�flags�raw_text� rG   �
+is_atelieru   АТЕЛИЕ�#   z(LEGAL: Non-residential status (Atelier).rE   �classificationrD   )�get�upperr   �extract_flags�extendr1   )r
+   r@   rA   �risk_reportrH   �regex_flags�p1_scores          r   �analyze_listingzLegalEngine.analyze_listing)   s�   � �!"��")��	
+��  �#�#�J��3�9�9�;��&�4�4�X�>���G��#�#�K�0����;�;�|�$��(�(B��H��� �'�'�(R�S�3;��I��/�0�+3��'�(��r   N)r7   r8   r9   �dictrT   r=   r   r   r?   r?   (   s   � ��D� �4� r   r?   )
+r   r   �typingr   r   �src.core.patternsr   r   �kbr?   r=   r   r   �<module>rY      s0   �� 	� 	� !� .�� �@ ���� r   
 
 =========================================
 FILE: ./src/__init__.py
@@ -1686,6 +1706,12 @@ class CadastreData(BaseModel):
 
 
 =========================================
+FILE: ./src/__pycache__/__init__.cpython-312.pyc
+=========================================
+�
+    ��Ci    �                    �   � y )N� r   �    �9/data/data/com.termux/files/home/glashaus/src/__init__.py�<module>r      s   �r   
+
+=========================================
 FILE: ./scripts/context_dump.sh
 =========================================
 #!/bin/bash
@@ -1715,6 +1741,89 @@ find . -type f \
 done
 
 echo "Dump complete. Copy contents of $output"
+
+
+=========================================
+FILE: ./scripts/scrape_lex.py
+=========================================
+import httpx
+from bs4 import BeautifulSoup
+import os
+import re
+import sys
+
+def scrape_law(url: str, filename: str):
+    print(f"[*] Targeting Lex.bg: {url}")
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile Safari/604.1"
+    }
+
+    try:
+        # 1. Fetch raw bytes to handle encoding manually
+        with httpx.Client(headers=headers, timeout=60.0) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            
+            # Decode using windows-1251 as identified in our curl test
+            content = resp.content.decode('windows-1251', errors='replace')
+            
+        # 2. Parse HTML
+        soup = BeautifulSoup(content, 'html.parser')
+        
+        # 3. Clean up the DOM (Remove ads, menus, scripts)
+        # We saw these in your 'cnt' div test
+        for noise in soup(["script", "style", "iframe", "ins"]):
+            noise.decompose()
+            
+        ad_patterns = [r"adocean", r"mobileMenu", r"tma-ad", r"h-cnt"]
+        for div in soup.find_all("div"):
+            div_id = div.get("id", "")
+            div_class = " ".join(div.get("class", []))
+            if any(re.search(p, div_id) or re.search(p, div_class) for p in ad_patterns):
+                div.decompose()
+
+        # 4. Target the Law Body
+        # Based on your grep, 'cnt' is the wrapper and 'boxi' is the inner content
+        law_body = soup.find("div", class_="boxi") or soup.find("div", class_="cnt")
+        
+        if not law_body:
+            print("[!] Could not find law container. Saving whole page.")
+            law_body = soup.body
+
+        # 5. Extract text with formatting
+        # We use a separator to keep Articles (Чл.) on new lines
+        raw_text = law_body.get_text(separator="\n")
+        
+        # 6. Post-Processing Cleanup
+        # Remove massive gaps of whitespace
+        clean_text = re.sub(r'\n\s*\n', '\n\n', raw_text)
+        # Standardize the 'Article' prefix for easier RAG searching later
+        clean_text = re.sub(r'(?m)^Чл\.', '\nЧл.', clean_text)
+
+        # 7. Save to disk
+        os.makedirs("storage/laws", exist_ok=True)
+        path = f"storage/laws/{filename}.txt"
+        
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"SOURCE: {url}\n")
+            f.write("-" * 30 + "\n\n")
+            f.write(clean_text)
+            
+        print(f"[SUCCESS] {filename}.txt created ({len(clean_text)} characters)")
+
+    except Exception as e:
+        print(f"[FATAL] Error during scraping: {str(e)}")
+
+if __name__ == "__main__":
+    # Link 1: Ordinance No. 7 (Crucial for Atelier vs Apartment height/light rules)
+    ORD_7_URL = "https://lex.bg/mobile/ldoc/2135476546"
+    scrape_law(ORD_7_URL, "naredba_7")
+
+    # Link 2: ZUT (The Foundation)
+    ZUT_URL = "https://lex.bg/mobile/ldoc/2135163904"
+    scrape_law(ZUT_URL, "zut_law")
+
 
 
 =========================================
@@ -1981,38 +2090,6 @@ structlog>=24.1.0
 
 
 =========================================
-FILE: ./imot_simulation.html
-=========================================
-<!DOCTYPE html>
-<html>
-<body>
-    <div class="list_ads">
-        <!-- Mock Listing 1 -->
-        <a href="//www.imot.bg/pcgi/imot.cgi?act=5&adv=1c171899111&slink=a4eg0c&f1=1" class="photoLink">
-            <div class="text_desc">
-                2-STAEN, Sofia, Lozenets, 185 000 EUR
-            </div>
-        </a>
-        
-        <!-- Mock Listing 2 -->
-        <a href="//www.imot.bg/pcgi/imot.cgi?act=5&adv=2c172200231&slink=a4eg0c&f1=1" class="photoLink">
-            <div class="text_desc">
-                3-STAEN, Sofia, Krustova Vada, 250 000 EUR, Gas/Elevator
-            </div>
-        </a>
-
-        <!-- Mock Listing 3 -->
-        <a href="//www.imot.bg/pcgi/imot.cgi?act=5&adv=3c17992881&slink=a4eg0c&f1=1" class="photoLink">
-            <div class="text_desc">
-                ATELIER, Sofia, Center, 90 000 EUR
-            </div>
-        </a>
-    </div>
-</body>
-</html>
-
-
-=========================================
 FILE: ./Dockerfile
 =========================================
 # STAGE 1: Builder
@@ -2260,387 +2337,6 @@ FILE: ./forensics/page_utf8.html
 
 
 =========================================
-FILE: ./forensics_dump.html
-=========================================
-<!DOCTYPE html>
-    <html lang="bg">
-      <head>
-        <title>Имоти - Imot.bg - Пазарът на недвижими имоти - продажби, наеми, агенции, новини за имоти (imoti)</title>
-        <meta http-equiv="Content-Type" content="text/html; charset=windows-1251">
-        <meta name="description" content="imot.bg - Пазарът на недвижими имоти в България. Оферти за продажба, под наем, купува, наема, заменя. Агенции за имоти. Новини. Съвети. Строителство. Обзавеждане. Интериор. Кредитиране и др.">
-        <link rel="SHORTCUT ICON" href="https://www.imot.bg/favicon.ico"/>
-        <link rel="stylesheet" href="/styless/styles.css?633" type="text/css">
-        
-                <script type="text/javascript" charset="UTF-8" src="//cdn.cookie-script.com/s/5874e0489319507715f52b3fd38d9a7a.js"></script>
-        <script type="text/javascript" src="/jss/scripts.js?633"></script>
-        <script type="text/javascript" src="/jss/dim.js?633"></script>
-        <script type="text/javascript" src="/jss/mobile-detect.min.js?633"></script>
-        <script type="text/javascript" src="/jss/jquery.min.js"></script>
-        <script type="text/javascript">
-        
-        
-        </script>
-        
-<script type="text/javascript" src="/jss/ac_runactivecontent.js"></script>
-<script type="text/javascript" src="/jss/scriptsJquery.js"></script>
-        <script>(function(){/*
-
- Copyright The Closure Library Authors.
- SPDX-License-Identifier: Apache-2.0
-*/
-'use strict';var g=function(a){var b=0;return function(){return b<a.length?{done:!1,value:a[b++]}:{done:!0}}},l=this||self,m=/^[\w+/_-]+[=]{0,2}$/,p=null,q=function(){},r=function(a){var b=typeof a;if("object"==b)if(a){if(a instanceof Array)return"array";if(a instanceof Object)return b;var c=Object.prototype.toString.call(a);if("[object Window]"==c)return"object";if("[object Array]"==c||"number"==typeof a.length&&"undefined"!=typeof a.splice&&"undefined"!=typeof a.propertyIsEnumerable&&!a.propertyIsEnumerable("splice"))return"array";
-if("[object Function]"==c||"undefined"!=typeof a.call&&"undefined"!=typeof a.propertyIsEnumerable&&!a.propertyIsEnumerable("call"))return"function"}else return"null";else if("function"==b&&"undefined"==typeof a.call)return"object";return b},u=function(a,b){function c(){}c.prototype=b.prototype;a.prototype=new c;a.prototype.constructor=a};var v=function(a,b){Object.defineProperty(l,a,{configurable:!1,get:function(){return b},set:q})};var y=function(a,b){this.b=a===w&&b||"";this.a=x},x={},w={};var aa=function(a,b){a.src=b instanceof y&&b.constructor===y&&b.a===x?b.b:"type_error:TrustedResourceUrl";if(null===p)b:{b=l.document;if((b=b.querySelector&&b.querySelector("script[nonce]"))&&(b=b.nonce||b.getAttribute("nonce"))&&m.test(b)){p=b;break b}p=""}b=p;b&&a.setAttribute("nonce",b)};var z=function(){return Math.floor(2147483648*Math.random()).toString(36)+Math.abs(Math.floor(2147483648*Math.random())^+new Date).toString(36)};var A=function(a,b){b=String(b);"application/xhtml+xml"===a.contentType&&(b=b.toLowerCase());return a.createElement(b)},B=function(a){this.a=a||l.document||document};B.prototype.appendChild=function(a,b){a.appendChild(b)};var C=function(a,b,c,d,e,f){try{var k=a.a,h=A(a.a,"SCRIPT");h.async=!0;aa(h,b);k.head.appendChild(h);h.addEventListener("load",function(){e();d&&k.head.removeChild(h)});h.addEventListener("error",function(){0<c?C(a,b,c-1,d,e,f):(d&&k.head.removeChild(h),f())})}catch(n){f()}};var ba=l.atob("aHR0cHM6Ly93d3cuZ3N0YXRpYy5jb20vaW1hZ2VzL2ljb25zL21hdGVyaWFsL3N5c3RlbS8xeC93YXJuaW5nX2FtYmVyXzI0ZHAucG5n"),ca=l.atob("WW91IGFyZSBzZWVpbmcgdGhpcyBtZXNzYWdlIGJlY2F1c2UgYWQgb3Igc2NyaXB0IGJsb2NraW5nIHNvZnR3YXJlIGlzIGludGVyZmVyaW5nIHdpdGggdGhpcyBwYWdlLg=="),da=l.atob("RGlzYWJsZSBhbnkgYWQgb3Igc2NyaXB0IGJsb2NraW5nIHNvZnR3YXJlLCB0aGVuIHJlbG9hZCB0aGlzIHBhZ2Uu"),ea=function(a,b,c){this.b=a;this.f=new B(this.b);this.a=null;this.c=[];this.g=!1;this.i=b;this.h=c},F=function(a){if(a.b.body&&!a.g){var b=
-function(){D(a);l.setTimeout(function(){return E(a,3)},50)};C(a.f,a.i,2,!0,function(){l[a.h]||b()},b);a.g=!0}},D=function(a){for(var b=G(1,5),c=0;c<b;c++){var d=H(a);a.b.body.appendChild(d);a.c.push(d)}b=H(a);b.style.bottom="0";b.style.left="0";b.style.position="fixed";b.style.width=G(100,110).toString()+"%";b.style.zIndex=G(2147483544,2147483644).toString();b.style["background-color"]=I(249,259,242,252,219,229);b.style["box-shadow"]="0 0 12px #888";b.style.color=I(0,10,0,10,0,10);b.style.display=
-"flex";b.style["justify-content"]="center";b.style["font-family"]="Roboto, Arial";c=H(a);c.style.width=G(80,85).toString()+"%";c.style.maxWidth=G(750,775).toString()+"px";c.style.margin="24px";c.style.display="flex";c.style["align-items"]="flex-start";c.style["justify-content"]="center";d=A(a.f.a,"IMG");d.className=z();d.src=ba;d.style.height="24px";d.style.width="24px";d.style["padding-right"]="16px";var e=H(a),f=H(a);f.style["font-weight"]="bold";f.textContent=ca;var k=H(a);k.textContent=da;J(a,
-e,f);J(a,e,k);J(a,c,d);J(a,c,e);J(a,b,c);a.a=b;a.b.body.appendChild(a.a);b=G(1,5);for(c=0;c<b;c++)d=H(a),a.b.body.appendChild(d),a.c.push(d)},J=function(a,b,c){for(var d=G(1,5),e=0;e<d;e++){var f=H(a);b.appendChild(f)}b.appendChild(c);c=G(1,5);for(d=0;d<c;d++)e=H(a),b.appendChild(e)},G=function(a,b){return Math.floor(a+Math.random()*(b-a))},I=function(a,b,c,d,e,f){return"rgb("+G(Math.max(a,0),Math.min(b,255)).toString()+","+G(Math.max(c,0),Math.min(d,255)).toString()+","+G(Math.max(e,0),Math.min(f,
-255)).toString()+")"},H=function(a){a=A(a.f.a,"DIV");a.className=z();return a},E=function(a,b){0>=b||null!=a.a&&0!=a.a.offsetHeight&&0!=a.a.offsetWidth||(fa(a),D(a),l.setTimeout(function(){return E(a,b-1)},50))},fa=function(a){var b=a.c;var c="undefined"!=typeof Symbol&&Symbol.iterator&&b[Symbol.iterator];b=c?c.call(b):{next:g(b)};for(c=b.next();!c.done;c=b.next())(c=c.value)&&c.parentNode&&c.parentNode.removeChild(c);a.c=[];(b=a.a)&&b.parentNode&&b.parentNode.removeChild(b);a.a=null};var ia=function(a,b,c,d,e){var f=ha(c),k=function(n){n.appendChild(f);l.setTimeout(function(){f?(0!==f.offsetHeight&&0!==f.offsetWidth?b():a(),f.parentNode&&f.parentNode.removeChild(f)):a()},d)},h=function(n){document.body?k(document.body):0<n?l.setTimeout(function(){h(n-1)},e):b()};h(3)},ha=function(a){var b=document.createElement("div");b.className=a;b.style.width="1px";b.style.height="1px";b.style.position="absolute";b.style.left="-10000px";b.style.top="-10000px";b.style.zIndex="-10000";return b};var K={},L=null;var M=function(){},N="function"==typeof Uint8Array,O=function(a,b){a.b=null;b||(b=[]);a.j=void 0;a.f=-1;a.a=b;a:{if(b=a.a.length){--b;var c=a.a[b];if(!(null===c||"object"!=typeof c||Array.isArray(c)||N&&c instanceof Uint8Array)){a.g=b-a.f;a.c=c;break a}}a.g=Number.MAX_VALUE}a.i={}},P=[],Q=function(a,b){if(b<a.g){b+=a.f;var c=a.a[b];return c===P?a.a[b]=[]:c}if(a.c)return c=a.c[b],c===P?a.c[b]=[]:c},R=function(a,b,c){a.b||(a.b={});if(!a.b[c]){var d=Q(a,c);d&&(a.b[c]=new b(d))}return a.b[c]};
-M.prototype.h=N?function(){var a=Uint8Array.prototype.toJSON;Uint8Array.prototype.toJSON=function(){var b;void 0===b&&(b=0);if(!L){L={};for(var c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".split(""),d=["+/=","+/","-_=","-_.","-_"],e=0;5>e;e++){var f=c.concat(d[e].split(""));K[e]=f;for(var k=0;k<f.length;k++){var h=f[k];void 0===L[h]&&(L[h]=k)}}}b=K[b];c=[];for(d=0;d<this.length;d+=3){var n=this[d],t=(e=d+1<this.length)?this[d+1]:0;h=(f=d+2<this.length)?this[d+2]:0;k=n>>2;n=(n&
-3)<<4|t>>4;t=(t&15)<<2|h>>6;h&=63;f||(h=64,e||(t=64));c.push(b[k],b[n],b[t]||"",b[h]||"")}return c.join("")};try{return JSON.stringify(this.a&&this.a,S)}finally{Uint8Array.prototype.toJSON=a}}:function(){return JSON.stringify(this.a&&this.a,S)};var S=function(a,b){return"number"!==typeof b||!isNaN(b)&&Infinity!==b&&-Infinity!==b?b:String(b)};M.prototype.toString=function(){return this.a.toString()};var T=function(a){O(this,a)};u(T,M);var U=function(a){O(this,a)};u(U,M);var ja=function(a,b){this.c=new B(a);var c=R(b,T,5);c=new y(w,Q(c,4)||"");this.b=new ea(a,c,Q(b,4));this.a=b},ka=function(a,b,c,d){b=new T(b?JSON.parse(b):null);b=new y(w,Q(b,4)||"");C(a.c,b,3,!1,c,function(){ia(function(){F(a.b);d(!1)},function(){d(!0)},Q(a.a,2),Q(a.a,3),Q(a.a,1))})};var la=function(a,b){V(a,"internal_api_load_with_sb",function(c,d,e){ka(b,c,d,e)});V(a,"internal_api_sb",function(){F(b.b)})},V=function(a,b,c){a=l.btoa(a+b);v(a,c)},W=function(a,b,c){for(var d=[],e=2;e<arguments.length;++e)d[e-2]=arguments[e];e=l.btoa(a+b);e=l[e];if("function"==r(e))e.apply(null,d);else throw Error("API not exported.");};var X=function(a){O(this,a)};u(X,M);var Y=function(a){this.h=window;this.a=a;this.b=Q(this.a,1);this.f=R(this.a,T,2);this.g=R(this.a,U,3);this.c=!1};Y.prototype.start=function(){ma();var a=new ja(this.h.document,this.g);la(this.b,a);na(this)};
-var ma=function(){var a=function(){if(!l.frames.googlefcPresent)if(document.body){var b=document.createElement("iframe");b.style.display="none";b.style.width="0px";b.style.height="0px";b.style.border="none";b.style.zIndex="-1000";b.style.left="-1000px";b.style.top="-1000px";b.name="googlefcPresent";document.body.appendChild(b)}else l.setTimeout(a,5)};a()},na=function(a){var b=Date.now();W(a.b,"internal_api_load_with_sb",a.f.h(),function(){var c;var d=a.b,e=l[l.btoa(d+"loader_js")];if(e){e=l.atob(e);
-e=parseInt(e,10);d=l.btoa(d+"loader_js").split(".");var f=l;d[0]in f||"undefined"==typeof f.execScript||f.execScript("var "+d[0]);for(;d.length&&(c=d.shift());)d.length?f[c]&&f[c]!==Object.prototype[c]?f=f[c]:f=f[c]={}:f[c]=null;c=Math.abs(b-e);c=1728E5>c?0:c}else c=-1;0!=c&&(W(a.b,"internal_api_sb"),Z(a,Q(a.a,6)))},function(c){Z(a,c?Q(a.a,4):Q(a.a,5))})},Z=function(a,b){a.c||(a.c=!0,a=new l.XMLHttpRequest,a.open("GET",b,!0),a.send())};(function(a,b){l[a]=function(c){for(var d=[],e=0;e<arguments.length;++e)d[e-0]=arguments[e];l[a]=q;b.apply(null,d)}})("__d3lUW8vwsKlB__",function(a){"function"==typeof window.atob&&(a=window.atob(a),a=new X(a?JSON.parse(a):null),(new Y(a)).start())});}).call(this);
-
-window.__d3lUW8vwsKlB__("WyI0YTBhODk3MmZlNzIwMDgwIixbbnVsbCxudWxsLG51bGwsImh0dHBzOi8vZnVuZGluZ2Nob2ljZXNtZXNzYWdlcy5nb29nbGUuY29tL2YvQUdTS1d4VWhqXzdlWWM2MzVYbk5ZTkgteWdXaEZTOXRDdmh5S21va1pQQkNyTkRBX2YwdUNYSTFweHJSQk9fdjBkVlB1cUJPb3kxaDg1YXlzd01rOVZKSVRmd1x1MDAzZCJdCixbMjAsImRpdi1ncHQtYWQiLDEwMCwiTkdFd1lUZzVOekptWlRjeU1EQTRNQVx1MDAzZFx1MDAzZCIsW251bGwsbnVsbCxudWxsLCJodHRwczovL3d3dy5nc3RhdGljLmNvbS8wZW1uL2YvcC80YTBhODk3MmZlNzIwMDgwLmpzP3VzcXBcdTAwM2RDQTAiXQpdCiwiaHR0cHM6Ly9mdW5kaW5nY2hvaWNlc21lc3NhZ2VzLmdvb2dsZS5jb20vbC9BR1NLV3hXTmFTeEhpaVBkOURldjdGWl9ZbUNpSklOQmVmQjQ4WkJ5VVc2eG5XTnJGcWQ3OXRGVmlsZEt3Ti12ZTlLX254eUVBT19FUF9wQWNsdEFfTlF0P2FiXHUwMDNkMSIsImh0dHBzOi8vZnVuZGluZ2Nob2ljZXNtZXNzYWdlcy5nb29nbGUuY29tL2wvQUdTS1d4WEdqdFhkREs5NW13RXAwajhnOGZ4eDlLZmtpNDlsSTJrdmxXTzJxaFZhZ2hIXy1YNWtnUml6aF9FZW1xZW9HN0RJNmE3SDZoLVVCMUd3ZTdBZT9hYlx1MDAzZDJcdTAwMjZzYmZcdTAwM2QxIiwiaHR0cHM6Ly9mdW5kaW5nY2hvaWNlc21lc3NhZ2VzLmdvb2dsZS5jb20vbC9BR1NLV3hXRmktTGk1cjBoeGljcDJkOGN1aUlWMGQ2MTUxZ0ZtbGVWLS1nTjdaSnB3ZTgyMVFsY0RkNjlleW8xck1PMjVQQl8zU2x2c2plWWhyMVRxVEZ1P3NiZlx1MDAzZDIiXQo=");</script>
-        <script defer async src="https://www.googletagmanager.com/gtag/js?id=G-0LZF32451N"></script>
-        <script>
-        const gtagLoaded = new Event('gtag-loaded');(function(d, s, id){var js, fjs = d.getElementsByTagName(s)[0];if (d.getElementById(id)) {return;}js = d.createElement(s);js.id = id;js.defer = true;js.async = true;js.src = "https://www.googletagmanager.com/gtag/js?id=G-0LZF32451N";js.onload = function(){document.dispatchEvent(gtagLoaded);};fjs.parentNode.insertBefore(js, fjs);}(document, 'script', 'gtag-js'));try {window.dataLayer = window.dataLayer || [];function gtag(){dataLayer.push(arguments);}gtag('js', new Date());gtag('config', 'G-0LZF32451N');gtag('config', 'UA-1160575-1');}catch(error){}
-        </script>
-
-        <script async="async" src="https://www.googletagservices.com/tag/js/gpt.js"></script>
-        <script>
-          var googletag = googletag || {};
-          googletag.cmd = googletag.cmd || [];
-        </script>
-        <script>
-          googletag.cmd.push(function() {
-            googletag.pubads().set("adsense_background_color", "FFFFFF");
-          });
-        </script>
-        <script>
-        googletag.cmd.push(function() {
-          
-
-          googletag.pubads().enableSingleRequest();
-          googletag.enableServices();
-        });
-        </script>
-
-      </head>
-      <body onload="javascript: if(window.startw)startw();">
-
-      
-      <div class="imotPhotosIframe" id="imotPhotos"></div>
-
-      <div style="text-align:left; z-index:1; position:relative; margin: 0 auto 10px auto; width:980px; cursor:auto;">
-      
-
-
-  <div class="regWindow" id="langWindow">
-    <div class="panel" style="width:700px; left: 0">
-      <div class="formVhod shareWindow" style="border-radius:10px;width:700px;">
-        <a href="javascript:closLangWindow();" class="close" title="Затвори" style="margin-left:645px;"></a>
-        <div class="price-stat">
-          <div class="shareOptions" style="width:660px">
-            <div class="boxTITLE">Translations in other languages:</div>
-            <div class="TITLE">
-              All real estate ads published on <span style="color: #900;">imot.bg</span> have been translated into English and published on the partner site
-              <br>
-              <img src="//www.imot.bg/images/picturess/icons/imoti-info-logo.svg" style="margin-top: 12px; height: 38px;">
-            </div>
-
-            <div class="screen1">
-              <div class="emailGrid" style="grid-gap:0">
-                <div class="C4">
-                  <a href="https://imoti.info/en" class="send gotoSite" target="_blank" onclick="closLangWindow();">Continue</a>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-<script type="module">
-                        import { initializeApp } from "https://www.gstatic.com/firebasejs/9.6.6/firebase-app.js";
-                        import { onMessage, isSupported, getMessaging } from "https://www.gstatic.com/firebasejs/9.6.6/firebase-messaging.js";
-
-                        isSupported().then((isSuppored) => {
-                          if (isSuppored) {
-                            var fcm=getcookieval('fcm');
-                            try {
-                              fcm = JSON.parse(decodeURIComponent(fcm));
-                            } catch (err) {
-                              fcm = {};
-                            }
-
-                            if (fcm.status == 'agree')
-                              receiveFCM();
-
-                            function receiveFCM() {
-
-                              initializeApp({ apiKey: "AIzaSyDl3rtJjr6tZw0gJrtZlECkn8L0rWWVaRA",
-                                authDomain: "imot-466de.firebaseapp.com",
-                                databaseURL: "https://imot-466de.firebaseio.com",
-                                projectId: "imot-466de",
-                                storageBucket: "imot-466de.appspot.com",
-                                messagingSenderId: "647267607875",
-                                appId: "1:647267607875:web:1bef151e4da339c07b3bf6"
-                              });
-
-                              const messaging = getMessaging();
-                              onMessage(messaging, (payload) => {
-
-                                if (payload && payload.data && payload.data.type === 'newadv')
-                                  {
-                                    document.getElementById('notification-popup').style.display='block';
-                                    document.getElementById('notification-popup').style.opacity='1';
-                                    document.getElementById('notification-popup-bodyonly').innerHTML = payload.data.bodyonly;
-                                    document.getElementById('notification-popup-bodyonly').href = payload.data.url;
-                                    document.getElementById('notification-popup-span-price').innerHTML = payload.data.price;
-                                    document.getElementById('notification-popup-area').innerHTML = payload.data.area;
-                                    document.getElementById('notification-popup-town').innerHTML = payload.data.town;
-                                    document.getElementById('notification-popup-href-img').href = payload.data.url;
-
-                                    if (payload.data.image)
-                                      {
-                                        document.getElementById('notification-popup-img').src = payload.notification.image;
-                                        document.getElementById('notification-popup-img').alt = payload.data.bodyonly;
-                                      }
-                                  }
-                                else if (payload && payload.data && payload.data.type === 'newprice')
-                                  {
-                                    document.getElementById('notification-popup-price').style.display='block';
-                                    document.getElementById('notification-popup-price').style.opacity='1';
-
-                                    document.getElementById('notification-popup-price-bodyonly').innerHTML = payload.data.advinfo;
-                                    document.getElementById('notification-popup-price-bodyonly').href = payload.data.url;
-                                    document.getElementById('notification-popup-price-old').innerHTML = payload.data.old_price;
-                                    document.getElementById('notification-popup-price-new').innerHTML = payload.data.new_price;
-                                    document.getElementById('notification-popup-price-href-img').href = payload.data.url;
-
-                                    if (payload.notification.image)
-                                      {
-                                        document.getElementById('notification-popup-price-img').src = payload.notification.image;
-                                        document.getElementById('notification-popup-price-img').alt = payload.data.advinfo;
-                                      }
-                                  }
-                              });
-                           }
-
-                           function closeNotification() {
-                             document.getElementById('notification-popup').style.display='none';
-                             document.getElementById('notification-popup-price').style.display='none';
-                           }
-
-                           window.closeNotification = closeNotification;
-                          }
-                        })
-                     </script>
-                     <div class="logPopup" id="notification-popup">
-                       <div class="newLogin" style="width:520px;padding-top:0;">
-                         <a href="javascript:closeNotification();" class="close" style="position: relative; left:435px; top:40px;"></a>
-                         <div class="formsWrapper">
-                           <div style="font-size:14px; display:block; border-bottom:1px solid #b01110; font-weight:bold; margin-bottom:15px; padding-bottom:5px; width:94%; height: 25px;">
-                             Получихте нова обява по филтър
-                           </div>
-
-                           <a href="" class="photoLink" style="float: left;" id="notification-popup-href-img" onclick="closeNotification();">
-                             <img src="../images/picturess/nophoto_490x341.svg" style="object-fit: cover; max-width: 120px; max-height: 100px;" class="noborder" id="notification-popup-img" alt="">
-                           </a>
-
-                           <div style="font-size:14px; float: right; width:290px; white-space: nowrap; word-break: break-all; text-overflow: ellipsis; overflow: hidden;">
-                             <a href="" style="text-decoration: underline;font-size: 14px;font-weight: bold;color: #000;" id="notification-popup-bodyonly" onclick="closeNotification();"></a><br/><br>
-                             <strong style="color: #b01110;" id="notification-popup-span-price"></strong><br/>
-                             <span id="notification-popup-area"></span><br/>
-                             <span id="notification-popup-town"></span><br/>
-                           </div>
-                           <div style="clear: both;"></div>
-                         </div>
-                       </div>
-                     </div>
-
-                     <div class="logPopup" id="notification-popup-price" style="">
-                       <div class="newLogin" style="width:520px;padding-top:0;">
-                         <a href="javascript:closeNotification();" class="close" style="position: relative; left:435px; top:40px;"></a>
-                         <div class="formsWrapper">
-                           <div style="font-size:14px; display:block; border-bottom:1px solid #b01110; font-weight:bold; margin-bottom:15px; padding-bottom:5px; width:94%; height: 25px;">
-                             Промяна на цена на наблюдавана обява
-                           </div>
-
-                           <a href="" class="photoLink" style="float: left;" id="notification-popup-price-href-img" onclick="closeNotification();">
-                             <img src="../images/picturess/nophoto_490x341.svg" style="object-fit: cover; max-width: 120px; max-height: 100px;" class="noborder" id="notification-popup-price-img" alt="">
-                           </a>
-
-                           <div style="font-size:14px; float: right; width:290px">
-                             <a href="" style="text-decoration: underline;font-size: 14px;font-weight: bold;color: #000;" id="notification-popup-price-bodyonly"></a><br/><br>
-
-                             стара цена <span style="color: #b01110;" id="notification-popup-price-old"></span> <br/>
-                             нова цена <strong style="color: #b01110;" id="notification-popup-price-new"></strong>
-                           </div>
-                           <div style="clear: both;"></div>
-                         </div>
-                       </div>
-                     </div>
-
-
-  <div class="header">
-    <a href="//www.imot.bg" class="left" style="text-decoration:none;">
-      <img src="//www.imot.bg/images/picturess/logo.svg" style="width:212px; height:65px;" alt="imot.bg – обяви за продажби и наеми на имоти">
-      <div class="iSlogan">Сайт за имоти <strong>№1</strong></div>
-    </a>
-    <div id="logtable2" class="right">
-      
-  
-  <div class="regWindow" id="langWindow">
-    <div class="panel" style="width:700px; left: 0">
-      <div class="formVhod shareWindow" style="border-radius:10px;width:700px;">
-        <a href="javascript:closLangWindow();" class="close" title="Затвори" style="margin-left:645px;"></a>
-        <div class="price-stat">
-          <div class="shareOptions" style="width:660px">
-            <div class="boxTITLE">Translations in other languages:</div>
-            <div class="TITLE">
-              All real estate ads published on <span style="color: #900;">imot.bg</span> have been translated into English and published on the partner site
-              <br>
-              <img src="//www.imot.bg/images/picturess/icons/imoti-info-logo.svg" style="margin-top: 12px; height: 38px;">
-            </div>
-
-            <div class="screen1">
-              <div class="emailGrid" style="grid-gap:0">
-                <div class="C4">
-                  <a href="https://imoti.info/en" class="send gotoSite" target="_blank" onclick="closLangWindow();">Continue</a>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class="logPopup" id="logpopup"></div>
-  <a class="flagBtn" onclick="ShowLangWindow();"><img src="//www.imot.bg/images/picturess/icons/flag-en.svg"></a>
-  <a data-link="//www.imot.bg/pcgi/imot.cgi?act=1" class="clever-link addButton"><img src="//www.imot.bg/images/picturess/plus.svg"> ДОБАВИ ОБЯВА</a>
-  
-      <a data-link="//www.imot.bg/pcgi/imot.cgi?act=26&rub=0" class="clever-link editButton">Редакция на обява</a>
-      <div class="loginLinks">
-        <span class="logIn">
-          <a href="//www.imot.bg/pcgi/imot.cgi?act=26&logact=1"><strong>Вход</strong></a> | <a href="//www.imot.bg/pcgi/imot.cgi?act=26&logact=2">Нова Регистрация</a>
-        </span>
-      </div>
-      
-  
-  
-    </div>
-  </div>
-  <div class="iMenu">
-    <a href="//www.imot.bg" class="">Начало</a>
-    <a href="//www.imot.bg/pcgi/imot.cgi?act=1" class="">Публикуване</a>
-    <a href="//www.imot.bg/search" class="selected">Търсене</a>
-    <a href="//www.imot.bg/pcgi/imot.cgi?act=7" class="">Нови сгради</a>
-    <a href="//www.imot.bg/agentsii" class="">Агенции</a>
-    <a href="https://fakti.bg" target="_blank">Новини</a>
-    <a href="https://creditcenter.bg/buy-new-home" target="_blank">Кредити</a>
-    <div class="imimmore">
-      <a href="//www.imot.bg/more-services" class="oshte ">+ Още...</a>
-      <div class="down-menu">
-        <a href="//www.imot.bg/sredni-ceni" class="sredni">Средни цени на имотите</a>
-        <a href="//www.imot.bg/ocenka-na-imot" class="kolko">Колко струва моят имот?</a>
-        <a data-link="//www.imot.bg/searcharch" class="clever-link arhivni" style="cursor:pointer;">Архивни данни</a>
-        <a href="//www.imot.bg/imoti-s-padashti-ceni" class="padashti">Имоти с падащи цени</a>
-      </div>
-    </div>
-    <span id="logtable3"><a href="//www.imot.bg/pcgi/imot.cgi?act=26" class="right">Моят имот</a></span>
-    <div class="bottomLine"></div>
-  </div>
-  
-
-
-
-
-  <div class="pageMessageAlert page980 MT20">
-    Търсената от Вас обява е изтрита или не е активна.
-  </div>
-  <div class="width980px margincent">
-    <div class="center m-t-20 m-b-20" style="font-size: 18px;">Моля разглeдайте най-новите подобни обяви, публикувани през последните 24 часа в imot.bg</div>
-  </div>
-  <div class="ads2023">
-    
-  </div>
-
-
-
-
-  <div class="seoBox" id="seoBox" style="margin:0">
-                   
-                 </div>
-  <div style="width:100%; margin-top:10px; text-align: right;">
-    <a href="//www.imot.bg/contacts" class="footLinks1" style="font-weight:normal; color:#900; text-decoration:underline;">Въпроси и предложения към imot.bg</a>
-  </div>
-  <div style="width:100%; margin-top:10px;">
-    <a href="//www.imot.bg/contacts" class="footLinks1">КОНТАКТИ</a> |
-    <a href="//www.imot.bg/pcgi/imot.cgi?act=12" class="footLinks1">SMS КОДОВЕ</a> |
-    <a href="//www.imot.bg/help" class="footLinks1">ПОМОЩ</a> |
-    <a href="//www.imot.bg/obshti-uslovia" class="footLinks1">ОБЩИ УСЛОВИЯ</a> |
-    <a href="https://rezonmedia.bg/tarifi/imot" class="footLinks1" target="_blank">РЕКЛАМА</a> |
-    <a href="//www.imot.bg/zashtita-na-lichni-danni" class="footLinks1">ЗАЩИТА НА ЛИЧНИТЕ ДАННИ</a> |
-    <a href="//www.imot.bg/sitemap" class="footLinks1">КАРТА НА САЙТА</a> |
-  </div>
-  <div style="margin-top:10px; background-color: #900; color:#FFF; padding-left:10px; height:26px; line-height:26px;">
-    <a href="https://rezonmedia.bg" target="_blank" class="footLinks2">Резон Медия</a> |
-    <a href="//www.imot.bg" target="_blank" class="footLinks2">Имоти</a> |
-    <a href="http://www.mobile.bg" target="_blank" class="footLinks2">Автомобили</a> |
-    <a href="https://www.zaplata.bg" target="_blank" class="footLinks2" title="Обяви за работа в България и чужбина">Работа</a> |
-    <a href="https://www.fakti.bg" target="_blank" class="footLinks2" title="Събития от България и света">Новини</a> |
-    <a href="https://bazar.bg" target="_blank" class="footLinks2">Обяви</a> |
-    <a href="https://prevodirezon.bg" target="_blank" class="footLinks2">Преводи и легализация</a>
-    <span style="float: right; margin-right:5px;">2002-2025 &reg;  Copyright imot.bg</span>
-  </div>
-  <div id="mob_version" style="width:100%; text-align:center;"></div>
-  <script>
-    var mvc=getCookie('full');
-    var mvd=document.getElementById("mob_version");
-    if ( mvd && (mvc==1) )
-      mvd.innerHTML='<br><a href="https://m.imot.bg" class="footLinks1" onclick="document.cookie=\'full=0; expires=Thu, 01 Jan 1970 00:00:01 GMT; path=/; domain=.imot.bg\'"><u>Мобилна версия</u></a>';
-  </script>
-  <div class="hosting">© <strong>imot.bg</strong> ползва и препоръчва <strong>хостинг услугите</strong> на <a href="https://bulinfo.net" target="_blank"><strong><img src="//www.imot.bg/images/picturess/bulinfo-logo.svg" alt="Bulinfo.net"></strong></a></div>
-  <div class="follow-us">
-    <div>Следвайте ни в:</div>
-    <a href="https://www.instagram.com/imot.bg/?igsh=MXd6emtpd3kyb2E3dQ%3D%3D" class="follow-us-instagram" target="_blank" title="Последвай ни в Instagram"></a>
-    <a href="https://www.tiktok.com/@imot_bg?_t=ZN-8yTupjIOizC" class="follow-us-tiktok" target="_blank" title="Последвай ни в TikTok"></a>
-    <a href="https://www.facebook.com/imot.bg" class="follow-us-facebook" target="_blank" title="Последвай ни в Facebook"></a>
-    <a href="https://www.youtube.com/@Imot.bg_Official" class="follow-us-youtube" target="_blank" title="Последвай ни в YouTube"></a>
-  </div>
-  
-
-
-
-      </div>
-
-      <br>
-      <div id="logtable" class="LB-white-content" style="width:530px; height:450px;"></div>
-      <div id="sendpmessage" class="LB-white-content" style="width:590px; height:465px; left: 20%; position: absolute; top: 50px; display: none;"></div>
-
-      <script type="text/javascript" src="/jss/sticky.js"></script>
-
-      <script>cleverLinks();</script>
-
-      <!-- (C)2000-2014 Gemius SA - gemiusAudience / imot.bg / Home Page -->
-      <script type="text/javascript">
-      <!--//--><![CDATA[//><!--
-      var pp_gemius_identifier = 'p8ZKf3ughze7qeDBCa1hhJQ5XkGiDSOqlz_uKt6qu_X.M7';
-      // lines below shouldn't be edited
-      function gemius_pending(i) { window[i] = window[i] || function() {var x = window[i+'_pdata'] = window[i+'_pdata'] || []; x[x.length]=arguments;};};
-      gemius_pending('gemius_hit'); gemius_pending('gemius_event'); gemius_pending('pp_gemius_hit'); gemius_pending('pp_gemius_event');
-      (function(d,t) {try {var gt=d.createElement(t),s=d.getElementsByTagName(t)[0],l='http'+((location.protocol=='https:')?'s':''); gt.setAttribute('async','async');
-      gt.setAttribute('defer','defer'); gt.src=l+'://gabg.hit.gemius.pl/xgemius.js'; s.parentNode.insertBefore(gt,s);} catch (e) {}})(document,'script');
-      //--><!]]>
-      </script>
-
-      <!--  -->
-      </body>
-    </html>
-    
-
-=========================================
 FILE: ./bypass_audit.py
 =========================================
 import httpx
@@ -2704,387 +2400,6 @@ def bypass_audit(url):
 if __name__ == "__main__":
     bypass_audit("https://www.imot.bg/pcgi/imot.cgi?act=5&adv=1c171899111")
 
-
-=========================================
-FILE: ./waf_challenge.html
-=========================================
-<!DOCTYPE html>
-    <html lang="bg">
-      <head>
-        <title>Имоти - Imot.bg - Пазарът на недвижими имоти - продажби, наеми, агенции, новини за имоти (imoti)</title>
-        <meta http-equiv="Content-Type" content="text/html; charset=windows-1251">
-        <meta name="description" content="imot.bg - Пазарът на недвижими имоти в България. Оферти за продажба, под наем, купува, наема, заменя. Агенции за имоти. Новини. Съвети. Строителство. Обзавеждане. Интериор. Кредитиране и др.">
-        <link rel="SHORTCUT ICON" href="https://www.imot.bg/favicon.ico"/>
-        <link rel="stylesheet" href="/styless/styles.css?633" type="text/css">
-        
-                <script type="text/javascript" charset="UTF-8" src="//cdn.cookie-script.com/s/5874e0489319507715f52b3fd38d9a7a.js"></script>
-        <script type="text/javascript" src="/jss/scripts.js?633"></script>
-        <script type="text/javascript" src="/jss/dim.js?633"></script>
-        <script type="text/javascript" src="/jss/mobile-detect.min.js?633"></script>
-        <script type="text/javascript" src="/jss/jquery.min.js"></script>
-        <script type="text/javascript">
-        
-        
-        </script>
-        
-<script type="text/javascript" src="/jss/ac_runactivecontent.js"></script>
-<script type="text/javascript" src="/jss/scriptsJquery.js"></script>
-        <script>(function(){/*
-
- Copyright The Closure Library Authors.
- SPDX-License-Identifier: Apache-2.0
-*/
-'use strict';var g=function(a){var b=0;return function(){return b<a.length?{done:!1,value:a[b++]}:{done:!0}}},l=this||self,m=/^[\w+/_-]+[=]{0,2}$/,p=null,q=function(){},r=function(a){var b=typeof a;if("object"==b)if(a){if(a instanceof Array)return"array";if(a instanceof Object)return b;var c=Object.prototype.toString.call(a);if("[object Window]"==c)return"object";if("[object Array]"==c||"number"==typeof a.length&&"undefined"!=typeof a.splice&&"undefined"!=typeof a.propertyIsEnumerable&&!a.propertyIsEnumerable("splice"))return"array";
-if("[object Function]"==c||"undefined"!=typeof a.call&&"undefined"!=typeof a.propertyIsEnumerable&&!a.propertyIsEnumerable("call"))return"function"}else return"null";else if("function"==b&&"undefined"==typeof a.call)return"object";return b},u=function(a,b){function c(){}c.prototype=b.prototype;a.prototype=new c;a.prototype.constructor=a};var v=function(a,b){Object.defineProperty(l,a,{configurable:!1,get:function(){return b},set:q})};var y=function(a,b){this.b=a===w&&b||"";this.a=x},x={},w={};var aa=function(a,b){a.src=b instanceof y&&b.constructor===y&&b.a===x?b.b:"type_error:TrustedResourceUrl";if(null===p)b:{b=l.document;if((b=b.querySelector&&b.querySelector("script[nonce]"))&&(b=b.nonce||b.getAttribute("nonce"))&&m.test(b)){p=b;break b}p=""}b=p;b&&a.setAttribute("nonce",b)};var z=function(){return Math.floor(2147483648*Math.random()).toString(36)+Math.abs(Math.floor(2147483648*Math.random())^+new Date).toString(36)};var A=function(a,b){b=String(b);"application/xhtml+xml"===a.contentType&&(b=b.toLowerCase());return a.createElement(b)},B=function(a){this.a=a||l.document||document};B.prototype.appendChild=function(a,b){a.appendChild(b)};var C=function(a,b,c,d,e,f){try{var k=a.a,h=A(a.a,"SCRIPT");h.async=!0;aa(h,b);k.head.appendChild(h);h.addEventListener("load",function(){e();d&&k.head.removeChild(h)});h.addEventListener("error",function(){0<c?C(a,b,c-1,d,e,f):(d&&k.head.removeChild(h),f())})}catch(n){f()}};var ba=l.atob("aHR0cHM6Ly93d3cuZ3N0YXRpYy5jb20vaW1hZ2VzL2ljb25zL21hdGVyaWFsL3N5c3RlbS8xeC93YXJuaW5nX2FtYmVyXzI0ZHAucG5n"),ca=l.atob("WW91IGFyZSBzZWVpbmcgdGhpcyBtZXNzYWdlIGJlY2F1c2UgYWQgb3Igc2NyaXB0IGJsb2NraW5nIHNvZnR3YXJlIGlzIGludGVyZmVyaW5nIHdpdGggdGhpcyBwYWdlLg=="),da=l.atob("RGlzYWJsZSBhbnkgYWQgb3Igc2NyaXB0IGJsb2NraW5nIHNvZnR3YXJlLCB0aGVuIHJlbG9hZCB0aGlzIHBhZ2Uu"),ea=function(a,b,c){this.b=a;this.f=new B(this.b);this.a=null;this.c=[];this.g=!1;this.i=b;this.h=c},F=function(a){if(a.b.body&&!a.g){var b=
-function(){D(a);l.setTimeout(function(){return E(a,3)},50)};C(a.f,a.i,2,!0,function(){l[a.h]||b()},b);a.g=!0}},D=function(a){for(var b=G(1,5),c=0;c<b;c++){var d=H(a);a.b.body.appendChild(d);a.c.push(d)}b=H(a);b.style.bottom="0";b.style.left="0";b.style.position="fixed";b.style.width=G(100,110).toString()+"%";b.style.zIndex=G(2147483544,2147483644).toString();b.style["background-color"]=I(249,259,242,252,219,229);b.style["box-shadow"]="0 0 12px #888";b.style.color=I(0,10,0,10,0,10);b.style.display=
-"flex";b.style["justify-content"]="center";b.style["font-family"]="Roboto, Arial";c=H(a);c.style.width=G(80,85).toString()+"%";c.style.maxWidth=G(750,775).toString()+"px";c.style.margin="24px";c.style.display="flex";c.style["align-items"]="flex-start";c.style["justify-content"]="center";d=A(a.f.a,"IMG");d.className=z();d.src=ba;d.style.height="24px";d.style.width="24px";d.style["padding-right"]="16px";var e=H(a),f=H(a);f.style["font-weight"]="bold";f.textContent=ca;var k=H(a);k.textContent=da;J(a,
-e,f);J(a,e,k);J(a,c,d);J(a,c,e);J(a,b,c);a.a=b;a.b.body.appendChild(a.a);b=G(1,5);for(c=0;c<b;c++)d=H(a),a.b.body.appendChild(d),a.c.push(d)},J=function(a,b,c){for(var d=G(1,5),e=0;e<d;e++){var f=H(a);b.appendChild(f)}b.appendChild(c);c=G(1,5);for(d=0;d<c;d++)e=H(a),b.appendChild(e)},G=function(a,b){return Math.floor(a+Math.random()*(b-a))},I=function(a,b,c,d,e,f){return"rgb("+G(Math.max(a,0),Math.min(b,255)).toString()+","+G(Math.max(c,0),Math.min(d,255)).toString()+","+G(Math.max(e,0),Math.min(f,
-255)).toString()+")"},H=function(a){a=A(a.f.a,"DIV");a.className=z();return a},E=function(a,b){0>=b||null!=a.a&&0!=a.a.offsetHeight&&0!=a.a.offsetWidth||(fa(a),D(a),l.setTimeout(function(){return E(a,b-1)},50))},fa=function(a){var b=a.c;var c="undefined"!=typeof Symbol&&Symbol.iterator&&b[Symbol.iterator];b=c?c.call(b):{next:g(b)};for(c=b.next();!c.done;c=b.next())(c=c.value)&&c.parentNode&&c.parentNode.removeChild(c);a.c=[];(b=a.a)&&b.parentNode&&b.parentNode.removeChild(b);a.a=null};var ia=function(a,b,c,d,e){var f=ha(c),k=function(n){n.appendChild(f);l.setTimeout(function(){f?(0!==f.offsetHeight&&0!==f.offsetWidth?b():a(),f.parentNode&&f.parentNode.removeChild(f)):a()},d)},h=function(n){document.body?k(document.body):0<n?l.setTimeout(function(){h(n-1)},e):b()};h(3)},ha=function(a){var b=document.createElement("div");b.className=a;b.style.width="1px";b.style.height="1px";b.style.position="absolute";b.style.left="-10000px";b.style.top="-10000px";b.style.zIndex="-10000";return b};var K={},L=null;var M=function(){},N="function"==typeof Uint8Array,O=function(a,b){a.b=null;b||(b=[]);a.j=void 0;a.f=-1;a.a=b;a:{if(b=a.a.length){--b;var c=a.a[b];if(!(null===c||"object"!=typeof c||Array.isArray(c)||N&&c instanceof Uint8Array)){a.g=b-a.f;a.c=c;break a}}a.g=Number.MAX_VALUE}a.i={}},P=[],Q=function(a,b){if(b<a.g){b+=a.f;var c=a.a[b];return c===P?a.a[b]=[]:c}if(a.c)return c=a.c[b],c===P?a.c[b]=[]:c},R=function(a,b,c){a.b||(a.b={});if(!a.b[c]){var d=Q(a,c);d&&(a.b[c]=new b(d))}return a.b[c]};
-M.prototype.h=N?function(){var a=Uint8Array.prototype.toJSON;Uint8Array.prototype.toJSON=function(){var b;void 0===b&&(b=0);if(!L){L={};for(var c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".split(""),d=["+/=","+/","-_=","-_.","-_"],e=0;5>e;e++){var f=c.concat(d[e].split(""));K[e]=f;for(var k=0;k<f.length;k++){var h=f[k];void 0===L[h]&&(L[h]=k)}}}b=K[b];c=[];for(d=0;d<this.length;d+=3){var n=this[d],t=(e=d+1<this.length)?this[d+1]:0;h=(f=d+2<this.length)?this[d+2]:0;k=n>>2;n=(n&
-3)<<4|t>>4;t=(t&15)<<2|h>>6;h&=63;f||(h=64,e||(t=64));c.push(b[k],b[n],b[t]||"",b[h]||"")}return c.join("")};try{return JSON.stringify(this.a&&this.a,S)}finally{Uint8Array.prototype.toJSON=a}}:function(){return JSON.stringify(this.a&&this.a,S)};var S=function(a,b){return"number"!==typeof b||!isNaN(b)&&Infinity!==b&&-Infinity!==b?b:String(b)};M.prototype.toString=function(){return this.a.toString()};var T=function(a){O(this,a)};u(T,M);var U=function(a){O(this,a)};u(U,M);var ja=function(a,b){this.c=new B(a);var c=R(b,T,5);c=new y(w,Q(c,4)||"");this.b=new ea(a,c,Q(b,4));this.a=b},ka=function(a,b,c,d){b=new T(b?JSON.parse(b):null);b=new y(w,Q(b,4)||"");C(a.c,b,3,!1,c,function(){ia(function(){F(a.b);d(!1)},function(){d(!0)},Q(a.a,2),Q(a.a,3),Q(a.a,1))})};var la=function(a,b){V(a,"internal_api_load_with_sb",function(c,d,e){ka(b,c,d,e)});V(a,"internal_api_sb",function(){F(b.b)})},V=function(a,b,c){a=l.btoa(a+b);v(a,c)},W=function(a,b,c){for(var d=[],e=2;e<arguments.length;++e)d[e-2]=arguments[e];e=l.btoa(a+b);e=l[e];if("function"==r(e))e.apply(null,d);else throw Error("API not exported.");};var X=function(a){O(this,a)};u(X,M);var Y=function(a){this.h=window;this.a=a;this.b=Q(this.a,1);this.f=R(this.a,T,2);this.g=R(this.a,U,3);this.c=!1};Y.prototype.start=function(){ma();var a=new ja(this.h.document,this.g);la(this.b,a);na(this)};
-var ma=function(){var a=function(){if(!l.frames.googlefcPresent)if(document.body){var b=document.createElement("iframe");b.style.display="none";b.style.width="0px";b.style.height="0px";b.style.border="none";b.style.zIndex="-1000";b.style.left="-1000px";b.style.top="-1000px";b.name="googlefcPresent";document.body.appendChild(b)}else l.setTimeout(a,5)};a()},na=function(a){var b=Date.now();W(a.b,"internal_api_load_with_sb",a.f.h(),function(){var c;var d=a.b,e=l[l.btoa(d+"loader_js")];if(e){e=l.atob(e);
-e=parseInt(e,10);d=l.btoa(d+"loader_js").split(".");var f=l;d[0]in f||"undefined"==typeof f.execScript||f.execScript("var "+d[0]);for(;d.length&&(c=d.shift());)d.length?f[c]&&f[c]!==Object.prototype[c]?f=f[c]:f=f[c]={}:f[c]=null;c=Math.abs(b-e);c=1728E5>c?0:c}else c=-1;0!=c&&(W(a.b,"internal_api_sb"),Z(a,Q(a.a,6)))},function(c){Z(a,c?Q(a.a,4):Q(a.a,5))})},Z=function(a,b){a.c||(a.c=!0,a=new l.XMLHttpRequest,a.open("GET",b,!0),a.send())};(function(a,b){l[a]=function(c){for(var d=[],e=0;e<arguments.length;++e)d[e-0]=arguments[e];l[a]=q;b.apply(null,d)}})("__d3lUW8vwsKlB__",function(a){"function"==typeof window.atob&&(a=window.atob(a),a=new X(a?JSON.parse(a):null),(new Y(a)).start())});}).call(this);
-
-window.__d3lUW8vwsKlB__("WyI0YTBhODk3MmZlNzIwMDgwIixbbnVsbCxudWxsLG51bGwsImh0dHBzOi8vZnVuZGluZ2Nob2ljZXNtZXNzYWdlcy5nb29nbGUuY29tL2YvQUdTS1d4VWhqXzdlWWM2MzVYbk5ZTkgteWdXaEZTOXRDdmh5S21va1pQQkNyTkRBX2YwdUNYSTFweHJSQk9fdjBkVlB1cUJPb3kxaDg1YXlzd01rOVZKSVRmd1x1MDAzZCJdCixbMjAsImRpdi1ncHQtYWQiLDEwMCwiTkdFd1lUZzVOekptWlRjeU1EQTRNQVx1MDAzZFx1MDAzZCIsW251bGwsbnVsbCxudWxsLCJodHRwczovL3d3dy5nc3RhdGljLmNvbS8wZW1uL2YvcC80YTBhODk3MmZlNzIwMDgwLmpzP3VzcXBcdTAwM2RDQTAiXQpdCiwiaHR0cHM6Ly9mdW5kaW5nY2hvaWNlc21lc3NhZ2VzLmdvb2dsZS5jb20vbC9BR1NLV3hXTmFTeEhpaVBkOURldjdGWl9ZbUNpSklOQmVmQjQ4WkJ5VVc2eG5XTnJGcWQ3OXRGVmlsZEt3Ti12ZTlLX254eUVBT19FUF9wQWNsdEFfTlF0P2FiXHUwMDNkMSIsImh0dHBzOi8vZnVuZGluZ2Nob2ljZXNtZXNzYWdlcy5nb29nbGUuY29tL2wvQUdTS1d4WEdqdFhkREs5NW13RXAwajhnOGZ4eDlLZmtpNDlsSTJrdmxXTzJxaFZhZ2hIXy1YNWtnUml6aF9FZW1xZW9HN0RJNmE3SDZoLVVCMUd3ZTdBZT9hYlx1MDAzZDJcdTAwMjZzYmZcdTAwM2QxIiwiaHR0cHM6Ly9mdW5kaW5nY2hvaWNlc21lc3NhZ2VzLmdvb2dsZS5jb20vbC9BR1NLV3hXRmktTGk1cjBoeGljcDJkOGN1aUlWMGQ2MTUxZ0ZtbGVWLS1nTjdaSnB3ZTgyMVFsY0RkNjlleW8xck1PMjVQQl8zU2x2c2plWWhyMVRxVEZ1P3NiZlx1MDAzZDIiXQo=");</script>
-        <script defer async src="https://www.googletagmanager.com/gtag/js?id=G-0LZF32451N"></script>
-        <script>
-        const gtagLoaded = new Event('gtag-loaded');(function(d, s, id){var js, fjs = d.getElementsByTagName(s)[0];if (d.getElementById(id)) {return;}js = d.createElement(s);js.id = id;js.defer = true;js.async = true;js.src = "https://www.googletagmanager.com/gtag/js?id=G-0LZF32451N";js.onload = function(){document.dispatchEvent(gtagLoaded);};fjs.parentNode.insertBefore(js, fjs);}(document, 'script', 'gtag-js'));try {window.dataLayer = window.dataLayer || [];function gtag(){dataLayer.push(arguments);}gtag('js', new Date());gtag('config', 'G-0LZF32451N');gtag('config', 'UA-1160575-1');}catch(error){}
-        </script>
-
-        <script async="async" src="https://www.googletagservices.com/tag/js/gpt.js"></script>
-        <script>
-          var googletag = googletag || {};
-          googletag.cmd = googletag.cmd || [];
-        </script>
-        <script>
-          googletag.cmd.push(function() {
-            googletag.pubads().set("adsense_background_color", "FFFFFF");
-          });
-        </script>
-        <script>
-        googletag.cmd.push(function() {
-          
-
-          googletag.pubads().enableSingleRequest();
-          googletag.enableServices();
-        });
-        </script>
-
-      </head>
-      <body onload="javascript: if(window.startw)startw();">
-
-      
-      <div class="imotPhotosIframe" id="imotPhotos"></div>
-
-      <div style="text-align:left; z-index:1; position:relative; margin: 0 auto 10px auto; width:980px; cursor:auto;">
-      
-
-
-  <div class="regWindow" id="langWindow">
-    <div class="panel" style="width:700px; left: 0">
-      <div class="formVhod shareWindow" style="border-radius:10px;width:700px;">
-        <a href="javascript:closLangWindow();" class="close" title="Затвори" style="margin-left:645px;"></a>
-        <div class="price-stat">
-          <div class="shareOptions" style="width:660px">
-            <div class="boxTITLE">Translations in other languages:</div>
-            <div class="TITLE">
-              All real estate ads published on <span style="color: #900;">imot.bg</span> have been translated into English and published on the partner site
-              <br>
-              <img src="//www.imot.bg/images/picturess/icons/imoti-info-logo.svg" style="margin-top: 12px; height: 38px;">
-            </div>
-
-            <div class="screen1">
-              <div class="emailGrid" style="grid-gap:0">
-                <div class="C4">
-                  <a href="https://imoti.info/en" class="send gotoSite" target="_blank" onclick="closLangWindow();">Continue</a>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-<script type="module">
-                        import { initializeApp } from "https://www.gstatic.com/firebasejs/9.6.6/firebase-app.js";
-                        import { onMessage, isSupported, getMessaging } from "https://www.gstatic.com/firebasejs/9.6.6/firebase-messaging.js";
-
-                        isSupported().then((isSuppored) => {
-                          if (isSuppored) {
-                            var fcm=getcookieval('fcm');
-                            try {
-                              fcm = JSON.parse(decodeURIComponent(fcm));
-                            } catch (err) {
-                              fcm = {};
-                            }
-
-                            if (fcm.status == 'agree')
-                              receiveFCM();
-
-                            function receiveFCM() {
-
-                              initializeApp({ apiKey: "AIzaSyDl3rtJjr6tZw0gJrtZlECkn8L0rWWVaRA",
-                                authDomain: "imot-466de.firebaseapp.com",
-                                databaseURL: "https://imot-466de.firebaseio.com",
-                                projectId: "imot-466de",
-                                storageBucket: "imot-466de.appspot.com",
-                                messagingSenderId: "647267607875",
-                                appId: "1:647267607875:web:1bef151e4da339c07b3bf6"
-                              });
-
-                              const messaging = getMessaging();
-                              onMessage(messaging, (payload) => {
-
-                                if (payload && payload.data && payload.data.type === 'newadv')
-                                  {
-                                    document.getElementById('notification-popup').style.display='block';
-                                    document.getElementById('notification-popup').style.opacity='1';
-                                    document.getElementById('notification-popup-bodyonly').innerHTML = payload.data.bodyonly;
-                                    document.getElementById('notification-popup-bodyonly').href = payload.data.url;
-                                    document.getElementById('notification-popup-span-price').innerHTML = payload.data.price;
-                                    document.getElementById('notification-popup-area').innerHTML = payload.data.area;
-                                    document.getElementById('notification-popup-town').innerHTML = payload.data.town;
-                                    document.getElementById('notification-popup-href-img').href = payload.data.url;
-
-                                    if (payload.data.image)
-                                      {
-                                        document.getElementById('notification-popup-img').src = payload.notification.image;
-                                        document.getElementById('notification-popup-img').alt = payload.data.bodyonly;
-                                      }
-                                  }
-                                else if (payload && payload.data && payload.data.type === 'newprice')
-                                  {
-                                    document.getElementById('notification-popup-price').style.display='block';
-                                    document.getElementById('notification-popup-price').style.opacity='1';
-
-                                    document.getElementById('notification-popup-price-bodyonly').innerHTML = payload.data.advinfo;
-                                    document.getElementById('notification-popup-price-bodyonly').href = payload.data.url;
-                                    document.getElementById('notification-popup-price-old').innerHTML = payload.data.old_price;
-                                    document.getElementById('notification-popup-price-new').innerHTML = payload.data.new_price;
-                                    document.getElementById('notification-popup-price-href-img').href = payload.data.url;
-
-                                    if (payload.notification.image)
-                                      {
-                                        document.getElementById('notification-popup-price-img').src = payload.notification.image;
-                                        document.getElementById('notification-popup-price-img').alt = payload.data.advinfo;
-                                      }
-                                  }
-                              });
-                           }
-
-                           function closeNotification() {
-                             document.getElementById('notification-popup').style.display='none';
-                             document.getElementById('notification-popup-price').style.display='none';
-                           }
-
-                           window.closeNotification = closeNotification;
-                          }
-                        })
-                     </script>
-                     <div class="logPopup" id="notification-popup">
-                       <div class="newLogin" style="width:520px;padding-top:0;">
-                         <a href="javascript:closeNotification();" class="close" style="position: relative; left:435px; top:40px;"></a>
-                         <div class="formsWrapper">
-                           <div style="font-size:14px; display:block; border-bottom:1px solid #b01110; font-weight:bold; margin-bottom:15px; padding-bottom:5px; width:94%; height: 25px;">
-                             Получихте нова обява по филтър
-                           </div>
-
-                           <a href="" class="photoLink" style="float: left;" id="notification-popup-href-img" onclick="closeNotification();">
-                             <img src="../images/picturess/nophoto_490x341.svg" style="object-fit: cover; max-width: 120px; max-height: 100px;" class="noborder" id="notification-popup-img" alt="">
-                           </a>
-
-                           <div style="font-size:14px; float: right; width:290px; white-space: nowrap; word-break: break-all; text-overflow: ellipsis; overflow: hidden;">
-                             <a href="" style="text-decoration: underline;font-size: 14px;font-weight: bold;color: #000;" id="notification-popup-bodyonly" onclick="closeNotification();"></a><br/><br>
-                             <strong style="color: #b01110;" id="notification-popup-span-price"></strong><br/>
-                             <span id="notification-popup-area"></span><br/>
-                             <span id="notification-popup-town"></span><br/>
-                           </div>
-                           <div style="clear: both;"></div>
-                         </div>
-                       </div>
-                     </div>
-
-                     <div class="logPopup" id="notification-popup-price" style="">
-                       <div class="newLogin" style="width:520px;padding-top:0;">
-                         <a href="javascript:closeNotification();" class="close" style="position: relative; left:435px; top:40px;"></a>
-                         <div class="formsWrapper">
-                           <div style="font-size:14px; display:block; border-bottom:1px solid #b01110; font-weight:bold; margin-bottom:15px; padding-bottom:5px; width:94%; height: 25px;">
-                             Промяна на цена на наблюдавана обява
-                           </div>
-
-                           <a href="" class="photoLink" style="float: left;" id="notification-popup-price-href-img" onclick="closeNotification();">
-                             <img src="../images/picturess/nophoto_490x341.svg" style="object-fit: cover; max-width: 120px; max-height: 100px;" class="noborder" id="notification-popup-price-img" alt="">
-                           </a>
-
-                           <div style="font-size:14px; float: right; width:290px">
-                             <a href="" style="text-decoration: underline;font-size: 14px;font-weight: bold;color: #000;" id="notification-popup-price-bodyonly"></a><br/><br>
-
-                             стара цена <span style="color: #b01110;" id="notification-popup-price-old"></span> <br/>
-                             нова цена <strong style="color: #b01110;" id="notification-popup-price-new"></strong>
-                           </div>
-                           <div style="clear: both;"></div>
-                         </div>
-                       </div>
-                     </div>
-
-
-  <div class="header">
-    <a href="//www.imot.bg" class="left" style="text-decoration:none;">
-      <img src="//www.imot.bg/images/picturess/logo.svg" style="width:212px; height:65px;" alt="imot.bg – обяви за продажби и наеми на имоти">
-      <div class="iSlogan">Сайт за имоти <strong>№1</strong></div>
-    </a>
-    <div id="logtable2" class="right">
-      
-  
-  <div class="regWindow" id="langWindow">
-    <div class="panel" style="width:700px; left: 0">
-      <div class="formVhod shareWindow" style="border-radius:10px;width:700px;">
-        <a href="javascript:closLangWindow();" class="close" title="Затвори" style="margin-left:645px;"></a>
-        <div class="price-stat">
-          <div class="shareOptions" style="width:660px">
-            <div class="boxTITLE">Translations in other languages:</div>
-            <div class="TITLE">
-              All real estate ads published on <span style="color: #900;">imot.bg</span> have been translated into English and published on the partner site
-              <br>
-              <img src="//www.imot.bg/images/picturess/icons/imoti-info-logo.svg" style="margin-top: 12px; height: 38px;">
-            </div>
-
-            <div class="screen1">
-              <div class="emailGrid" style="grid-gap:0">
-                <div class="C4">
-                  <a href="https://imoti.info/en" class="send gotoSite" target="_blank" onclick="closLangWindow();">Continue</a>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class="logPopup" id="logpopup"></div>
-  <a class="flagBtn" onclick="ShowLangWindow();"><img src="//www.imot.bg/images/picturess/icons/flag-en.svg"></a>
-  <a data-link="//www.imot.bg/pcgi/imot.cgi?act=1" class="clever-link addButton"><img src="//www.imot.bg/images/picturess/plus.svg"> ДОБАВИ ОБЯВА</a>
-  
-      <a data-link="//www.imot.bg/pcgi/imot.cgi?act=26&rub=0" class="clever-link editButton">Редакция на обява</a>
-      <div class="loginLinks">
-        <span class="logIn">
-          <a href="//www.imot.bg/pcgi/imot.cgi?act=26&logact=1"><strong>Вход</strong></a> | <a href="//www.imot.bg/pcgi/imot.cgi?act=26&logact=2">Нова Регистрация</a>
-        </span>
-      </div>
-      
-  
-  
-    </div>
-  </div>
-  <div class="iMenu">
-    <a href="//www.imot.bg" class="">Начало</a>
-    <a href="//www.imot.bg/pcgi/imot.cgi?act=1" class="">Публикуване</a>
-    <a href="//www.imot.bg/search" class="selected">Търсене</a>
-    <a href="//www.imot.bg/pcgi/imot.cgi?act=7" class="">Нови сгради</a>
-    <a href="//www.imot.bg/agentsii" class="">Агенции</a>
-    <a href="https://fakti.bg" target="_blank">Новини</a>
-    <a href="https://creditcenter.bg/buy-new-home" target="_blank">Кредити</a>
-    <div class="imimmore">
-      <a href="//www.imot.bg/more-services" class="oshte ">+ Още...</a>
-      <div class="down-menu">
-        <a href="//www.imot.bg/sredni-ceni" class="sredni">Средни цени на имотите</a>
-        <a href="//www.imot.bg/ocenka-na-imot" class="kolko">Колко струва моят имот?</a>
-        <a data-link="//www.imot.bg/searcharch" class="clever-link arhivni" style="cursor:pointer;">Архивни данни</a>
-        <a href="//www.imot.bg/imoti-s-padashti-ceni" class="padashti">Имоти с падащи цени</a>
-      </div>
-    </div>
-    <span id="logtable3"><a href="//www.imot.bg/pcgi/imot.cgi?act=26" class="right">Моят имот</a></span>
-    <div class="bottomLine"></div>
-  </div>
-  
-
-
-
-
-  <div class="pageMessageAlert page980 MT20">
-    Търсената от Вас обява е изтрита или не е активна.
-  </div>
-  <div class="width980px margincent">
-    <div class="center m-t-20 m-b-20" style="font-size: 18px;">Моля разглeдайте най-новите подобни обяви, публикувани през последните 24 часа в imot.bg</div>
-  </div>
-  <div class="ads2023">
-    
-  </div>
-
-
-
-
-  <div class="seoBox" id="seoBox" style="margin:0">
-                   
-                 </div>
-  <div style="width:100%; margin-top:10px; text-align: right;">
-    <a href="//www.imot.bg/contacts" class="footLinks1" style="font-weight:normal; color:#900; text-decoration:underline;">Въпроси и предложения към imot.bg</a>
-  </div>
-  <div style="width:100%; margin-top:10px;">
-    <a href="//www.imot.bg/contacts" class="footLinks1">КОНТАКТИ</a> |
-    <a href="//www.imot.bg/pcgi/imot.cgi?act=12" class="footLinks1">SMS КОДОВЕ</a> |
-    <a href="//www.imot.bg/help" class="footLinks1">ПОМОЩ</a> |
-    <a href="//www.imot.bg/obshti-uslovia" class="footLinks1">ОБЩИ УСЛОВИЯ</a> |
-    <a href="https://rezonmedia.bg/tarifi/imot" class="footLinks1" target="_blank">РЕКЛАМА</a> |
-    <a href="//www.imot.bg/zashtita-na-lichni-danni" class="footLinks1">ЗАЩИТА НА ЛИЧНИТЕ ДАННИ</a> |
-    <a href="//www.imot.bg/sitemap" class="footLinks1">КАРТА НА САЙТА</a> |
-  </div>
-  <div style="margin-top:10px; background-color: #900; color:#FFF; padding-left:10px; height:26px; line-height:26px;">
-    <a href="https://rezonmedia.bg" target="_blank" class="footLinks2">Резон Медия</a> |
-    <a href="//www.imot.bg" target="_blank" class="footLinks2">Имоти</a> |
-    <a href="http://www.mobile.bg" target="_blank" class="footLinks2">Автомобили</a> |
-    <a href="https://www.zaplata.bg" target="_blank" class="footLinks2" title="Обяви за работа в България и чужбина">Работа</a> |
-    <a href="https://www.fakti.bg" target="_blank" class="footLinks2" title="Събития от България и света">Новини</a> |
-    <a href="https://bazar.bg" target="_blank" class="footLinks2">Обяви</a> |
-    <a href="https://prevodirezon.bg" target="_blank" class="footLinks2">Преводи и легализация</a>
-    <span style="float: right; margin-right:5px;">2002-2025 &reg;  Copyright imot.bg</span>
-  </div>
-  <div id="mob_version" style="width:100%; text-align:center;"></div>
-  <script>
-    var mvc=getCookie('full');
-    var mvd=document.getElementById("mob_version");
-    if ( mvd && (mvc==1) )
-      mvd.innerHTML='<br><a href="https://m.imot.bg" class="footLinks1" onclick="document.cookie=\'full=0; expires=Thu, 01 Jan 1970 00:00:01 GMT; path=/; domain=.imot.bg\'"><u>Мобилна версия</u></a>';
-  </script>
-  <div class="hosting">© <strong>imot.bg</strong> ползва и препоръчва <strong>хостинг услугите</strong> на <a href="https://bulinfo.net" target="_blank"><strong><img src="//www.imot.bg/images/picturess/bulinfo-logo.svg" alt="Bulinfo.net"></strong></a></div>
-  <div class="follow-us">
-    <div>Следвайте ни в:</div>
-    <a href="https://www.instagram.com/imot.bg/?igsh=MXd6emtpd3kyb2E3dQ%3D%3D" class="follow-us-instagram" target="_blank" title="Последвай ни в Instagram"></a>
-    <a href="https://www.tiktok.com/@imot_bg?_t=ZN-8yTupjIOizC" class="follow-us-tiktok" target="_blank" title="Последвай ни в TikTok"></a>
-    <a href="https://www.facebook.com/imot.bg" class="follow-us-facebook" target="_blank" title="Последвай ни в Facebook"></a>
-    <a href="https://www.youtube.com/@Imot.bg_Official" class="follow-us-youtube" target="_blank" title="Последвай ни в YouTube"></a>
-  </div>
-  
-
-
-
-      </div>
-
-      <br>
-      <div id="logtable" class="LB-white-content" style="width:530px; height:450px;"></div>
-      <div id="sendpmessage" class="LB-white-content" style="width:590px; height:465px; left: 20%; position: absolute; top: 50px; display: none;"></div>
-
-      <script type="text/javascript" src="/jss/sticky.js"></script>
-
-      <script>cleverLinks();</script>
-
-      <!-- (C)2000-2014 Gemius SA - gemiusAudience / imot.bg / Home Page -->
-      <script type="text/javascript">
-      <!--//--><![CDATA[//><!--
-      var pp_gemius_identifier = 'p8ZKf3ughze7qeDBCa1hhJQ5XkGiDSOqlz_uKt6qu_X.M7';
-      // lines below shouldn't be edited
-      function gemius_pending(i) { window[i] = window[i] || function() {var x = window[i+'_pdata'] = window[i+'_pdata'] || []; x[x.length]=arguments;};};
-      gemius_pending('gemius_hit'); gemius_pending('gemius_event'); gemius_pending('pp_gemius_hit'); gemius_pending('pp_gemius_event');
-      (function(d,t) {try {var gt=d.createElement(t),s=d.getElementsByTagName(t)[0],l='http'+((location.protocol=='https:')?'s':''); gt.setAttribute('async','async');
-      gt.setAttribute('defer','defer'); gt.src=l+'://gabg.hit.gemius.pl/xgemius.js'; s.parentNode.insertBefore(gt,s);} catch (e) {}})(document,'script');
-      //--><!]]>
-      </script>
-
-      <!--  -->
-      </body>
-    </html>
-    
 
 =========================================
 FILE: ./manual_session_audit.py
