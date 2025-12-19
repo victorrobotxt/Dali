@@ -1,72 +1,56 @@
 from src.worker import celery_app
 from src.db.session import SessionLocal
 from src.db.models import Listing, Report, ReportStatus
-from src.services.repository import RealEstateRepository
 from src.services.scraper_service import ScraperService
 from src.services.ai_engine import GeminiService
-from src.services.risk_engine import RiskEngine
-from src.services.storage_service import StorageService
+from src.services.legal_engine import LegalEngine
+from src.services.report_generator import AttorneyReportGenerator
 from src.core.config import settings
-from src.core.utils import calculate_content_hash
 import asyncio
 
-@celery_app.task(
-    name="src.tasks.audit_listing",
-    bind=True,
-    max_retries=3,
-    default_retry_delay=60
-)
-def audit_listing_task(self, listing_id: int):
-    # Context Manager for DB session
-    with SessionLocal() as db:
-        try:
-            repo = RealEstateRepository(db)
-            scraper = ScraperService(simulation_mode=(settings.GEMINI_API_KEY == "mock-key"))
-            ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
-            risk_engine = RiskEngine()
-            storage = StorageService()
+@celery_app.task(name="src.tasks.audit_listing")
+def audit_listing_task(listing_id: int):
+    db = SessionLocal()
+    try:
+        scraper = ScraperService(simulation_mode=(settings.GEMINI_API_KEY == "mock-key"))
+        ai_engine = GeminiService(api_key=settings.GEMINI_API_KEY)
+        legal_engine = LegalEngine()
+        brief_gen = AttorneyReportGenerator()
 
-            listing = db.query(Listing).get(listing_id)
-            if not listing: return "Error: Missing ID"
+        listing = db.query(Listing).get(listing_id)
+        if not listing: return "Listing not found"
 
-            # 1. SCRAPE & ARCHIVE
-            data = scraper.scrape_url(listing.source_url)
-            
-            # Run async image archival
-            loop = asyncio.get_event_loop()
-            archived_images = loop.run_until_complete(storage.archive_images(listing_id, data["image_urls"]))
+        # 1. Scraping
+        scraped_data = scraper.scrape_url(listing.source_url)
+        
+        # 2. Tier 1 AI Forensic Analysis
+        loop = asyncio.get_event_loop()
+        ai_data = loop.run_until_complete(ai_engine.analyze_text(scraped_data["raw_text"]))
 
-            # 2. IDEMPOTENCY & UPDATE
-            chash = calculate_content_hash(data["raw_text"], data["price_predicted"])
-            repo.update_listing_data(listing_id, data["price_predicted"], data["area"], data["raw_text"], chash)
+        # 3. Apply Professional Legal Logic
+        legal_results = legal_engine.analyze_listing(scraped_data, ai_data)
+        legal_brief = brief_gen.generate_legal_brief(scraped_data, legal_results, ai_data)
 
-            # 3. AI TIERS
-            tier1 = loop.run_until_complete(ai_engine.analyze_text(data["raw_text"]))
-            confidence = tier1.get("confidence", 0)
-            total_cost = 0.04
+        # 4. Status Determination (The "Kill Switch")
+        status = ReportStatus.VERIFIED if legal_results["total_legal_score"] < 40 else ReportStatus.MANUAL_REVIEW
+        if legal_results["gatekeeper_verdict"] == "ABORT":
+            status = ReportStatus.REJECTED
 
-            if (confidence < 85 or tier1.get("is_atelier")) and settings.GEMINI_API_KEY != "mock-key":
-                tier2 = loop.run_until_complete(ai_engine.analyze_images(data["image_urls"]))
-                tier1["vision_insights"] = tier2
-                total_cost += 0.22
-                if tier2.get("estimated_location_confidence", 0) > 60:
-                    confidence = max(confidence, 90)
+        # 5. Commit Audit Report
+        report = Report(
+            listing_id=listing.id,
+            status=status,
+            risk_score=legal_results["total_legal_score"],
+            ai_confidence_score=ai_data["confidence"],
+            manual_review_notes=legal_brief,
+            discrepancy_details=legal_results
+        )
+        db.add(report)
+        db.commit()
+        return f"Audit Complete: Verdict {status}"
 
-            # 4. RISK
-            # Official Registry (Placeholder - logic stays same, data fetched via Repo later)
-            report_data = risk_engine.calculate_score(data, tier1)
-            
-            repo.create_report(
-                listing_id=listing_id,
-                risk=report_data["score"],
-                details={"flags": report_data["flags"], "ai": tier1},
-                cost=total_cost,
-                confidence=confidence,
-                images=archived_images
-            )
-            return f"Audit Complete for {listing_id}"
-
-        except Exception as exc:
-            print(f"[RETRYING] Task failed: {exc}")
-            raise self.retry(exc=exc)
-
+    except Exception as e:
+        print(f"[TASK_ERROR] {str(e)}")
+        return f"Failed: {str(e)}"
+    finally:
+        db.close()
