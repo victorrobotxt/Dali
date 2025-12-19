@@ -1,16 +1,19 @@
-from pydantic import BaseModel, HttpUrl, Field, condecimal
-from typing import List, Optional, Literal, Dict, Any
-from datetime import datetime
+from pydantic import BaseModel, Field, condecimal
+from decimal import Decimal
+from typing import List, Optional, Literal
 
-# 1. Scraper Layer
 class ScrapedListing(BaseModel):
     source_url: str
     raw_text: str
-    price_predicted: condecimal(max_digits=12, decimal_places=2) = Field(..., description="Normalized price in BGN")
+    # Precision Fix: Ensure financial math uses Decimal
+    price_predicted: condecimal(max_digits=12, decimal_places=2) 
     area_sqm: float
     image_urls: List[str] = []
+    
+    class Config:
+        # Ensures Decimal objects serialize to JSON strings correctly
+        json_encoders = {Decimal: str}
 
-# 2. Forensic/AI Layer
 class AIAnalysisResult(BaseModel):
     address_prediction: str
     neighborhood: str
@@ -19,7 +22,6 @@ class AIAnalysisResult(BaseModel):
     construction_year: int
     confidence_score: int = Field(default=0, ge=0, le=100)
 
-# 3. Registry Layer
 class RegistryCheck(BaseModel):
     registry_status: Literal["LIVE", "OFFLINE", "ERROR"] = "LIVE"
     details: str = ""
@@ -32,18 +34,16 @@ class CadastreData(BaseModel):
     status: Literal["LIVE", "OFFLINE", "NOT_FOUND", "ERROR"] = "NOT_FOUND"
     address_found: Optional[str] = None
 
-# 4. Risk Engine Layer
 class RiskAssessment(BaseModel):
     score: int = Field(default=0, ge=0, le=100)
     verdict: Literal["CLEAN", "WARNING", "CRITICAL", "FATAL"] = "CLEAN"
     flags: List[str] = []
     is_fatal: bool = False
 
-# 5. Master Object (Passed to Report Generator)
 class ConsolidatedAudit(BaseModel):
     scraped: ScrapedListing
     ai: AIAnalysisResult
     cadastre: CadastreData
-    compliance: RegistryCheck  # Act 16
-    city_risk: RegistryCheck   # Expropriation
+    compliance: RegistryCheck
+    city_risk: RegistryCheck
     risk_assessment: RiskAssessment
