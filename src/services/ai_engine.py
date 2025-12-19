@@ -1,14 +1,13 @@
 import google.generativeai as genai
 from pydantic import BaseModel, Field
-from src.core.config import settings
 
 class AIAnalysisSchema(BaseModel):
-    address_prediction: str = Field(description="Extracted address")
-    confidence: int = Field(description="0-100 score")
-    neighborhood: str = Field(description="Rayon name")
-    is_atelier: bool = Field(description="Legal status is atelier")
-    net_living_area: float = Field(description="Usable square meters")
-    construction_year: int = Field(description="Finish year")
+    address_prediction: str
+    neighborhood: str
+    is_atelier: bool
+    net_living_area: float
+    construction_year: int
+    confidence: int
 
 class GeminiService:
     def __init__(self, api_key: str):
@@ -18,7 +17,14 @@ class GeminiService:
         else: self.model = None
 
     async def analyze_text(self, text: str) -> dict:
-        if not self.model: return {"address_prediction": "Mock", "confidence": 0, "neighborhood": "Unknown", "is_atelier": False, "net_living_area": 0, "construction_year": 2024}
-        prompt = f"Perform forensic property analysis on: {text}"
+        if not self.model: return {"address_prediction": "Simulated", "confidence": 0, "neighborhood": "Unknown", "is_atelier": False, "net_living_area": 0, "construction_year": 2024}
+        
+        mandate = """
+        [ROLE] APEX PREDATOR REAL ESTATE ANALYST.
+        [OBJECTIVE] Extract forensic ground truth from listing. 
+        [RULES] Compare price vs neighborhood. Detect 'Ателие' (workspace) status. 
+        Identify 'Net Living Area' (чиста площ). 
+        """
+        prompt = f"{mandate}\n\nListing Data: {text[:5000]}"
         resp = self.model.generate_content(prompt, generation_config={"response_mime_type": "application/json", "response_json_schema": AIAnalysisSchema.model_json_schema()})
         return AIAnalysisSchema.model_validate_json(resp.text).model_dump()

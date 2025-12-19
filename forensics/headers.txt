@@ -1,0 +1,14 @@
+HTTP/2 200 
+date: Fri, 19 Dec 2025 10:22:43 GMT
+content-type: text/html
+server: cloudflare
+vary: Accept-Encoding
+set-cookie: imot_session_redirect=adv%091c171899111%09act%095%09; domain=.imot.bg; path=/
+referrer-policy: no-referrer-when-downgrade
+strict-transport-security: max-age=15552000
+nel: {"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
+cf-cache-status: DYNAMIC
+report-to: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=j9v062ydriN%2F%2BXubjtcJm8HyyWIt5Iad0Ozkt1xE1LO0Maoge0%2FxNlheTZuu%2FtFcpdrE5nQ8tbcs1nOXtqzEhMuYqUOOk1Zv"}]}
+cf-ray: 9b062e33d9d0d0d4-SOF
+alt-svc: h3=":443"; ma=86400
+
