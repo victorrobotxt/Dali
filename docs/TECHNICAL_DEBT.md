@@ -2,40 +2,31 @@
 
 ## Critical Severity (Must Fix Before Beta)
 
-### 1. Database Session Scope in Background Tasks
-- **Location:** `src/api/routes.py` -> `initiate_audit`
-- **Issue:** Passing the dependency-injected `db` session to `BackgroundTasks` causes `DetachedInstanceError` because the session closes when the HTTP response returns.
-- **Fix:** Refactor `process_audit_task` to instantiate a fresh `SessionLocal()` context manager internally.
-- **Reference:** SQLAlchemy Thread-Safety docs.
-
-### 2. AI Service Implementation
-- **Location:** `src/services/ai_engine.py`
-- **Issue:** Currently returns mock dictionary `{"confidence": 0.0}`.
-- **Fix:** 
-    - Initialize `genai.configure(api_key=...)`.
-    - Implement `generate_content` call for Gemini Flash (Text).
-    - Implement `generate_content` with Image inputs for Gemini Pro (Vision).
-    - Add Error Handling for "Safety Filters" or API Quotas.
-
-## Moderate Severity (Logic Gaps)
-
-### 3. Risk Scoring Algorithm
-- **Location:** Database Schema exists (`risk_score`), but logic is missing.
-- **Issue:** No calculator exists to translate discrepancies into a 0-100 integer.
-- **Fix:** Create `src/services/risk_engine.py`.
-    - Base Score: 0
-    - If `advertised_area` > `cadastre_area` (+20 pts).
-    - If `type` mismatch (Atelier vs Apt) (+30 pts).
-    - If `price_per_sqm` > 1.5x avg (+15 pts).
-
-### 4. Hardcoded Secrets
+### 1. Hardcoded Secrets (Config)
 - **Location:** `src/core/config.py`
-- **Issue:** Default "mock-key" risks silent failure in prod.
-- **Fix:** Implement `pydantic` validation to raise `ValueError` on startup if `GEMINI_API_KEY` is missing in production environment.
+- **Issue:** `GEMINI_API_KEY` defaults to "mock-key". While validated at runtime, this is bad practice.
+- **Fix:** Remove default value entirely and force `.env` loading.
 
-## Low Severity (Optimization)
+### 2. Scraper Fragility (DOM Coupling)
+- **Location:** `src/services/scraper_service.py` & `forensic_check.py`
+- **Issue:** Logic relies on specific HTML IDs (e.g., `id='price'`, `id='description_div'`).
+- **Risk:** High. If `imot.bg` updates their frontend classes, the "Space Hack" and Price normalization logic will fail silently.
+- **Fix:** Implement multi-selector fallbacks or move strictly to Visual DOM analysis (Gemini Vision) for extraction.
 
-### 5. Listing Normalization
-- **Location:** `src/services/repository.py`
-- **Issue:** Duplicate URLs might occur if query params differ (e.g., `?adv=1` vs `?adv=1&utm=facebook`).
-- **Fix:** Implement a URL cleaner utility to strip tracking parameters before hashing/storing.
+## Moderate Severity (Optimization)
+
+### 3. Synchronous Registry Calls in Loops
+- **Location:** `src/services/forensics_service.py`
+- **Issue:** While the task itself is async, some specialized sub-checks might still block the event loop if not strictly awaited.
+- **Fix:** Audit all `httpx` calls to ensure `await` is used consistently across the `gather()` chain.
+
+## Resolved Items (Fixed)
+
+### ✅ Database Session Scope in Background Tasks
+- **Fix:** `src/tasks.py` now explicitly initializes a thread-safe session using `with SessionLocal() as db:` inside the Celery worker.
+
+### ✅ Risk Scoring Algorithm
+- **Fix:** `RiskEngine` (V2) is implemented (`src/services/risk_engine.py`). It now calculates scores based on Expropriation (Fatal), Act 16 status, and Area discrepancy > 25%.
+
+### ✅ Listing Normalization
+- **Fix:** `RealEstateRepository` now normalizes URLs (forcing mobile subdomains) and checks for duplicates before insertion.

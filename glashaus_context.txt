@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Fri Dec 19 17:30:05 EET 2025
+Fri Dec 19 19:45:51 EET 2025
 
 
 --- GIT HISTORY ---
-* 2f79d2e (HEAD -> main) removed junk
+* a107438 (HEAD -> main) feat(core): implement forensic analysis and anti-manipulation logic
+* 2f79d2e removed junk
 * ed4950e feat(forensics): harden backend with LexSofia logic and municipal registry strikes
 * 00b1e10 feat(reporting): integrate forensic registry checks into Legal Brief generation
 * e3f1eaf fix(services): implement circuit breakers for government registry availability
@@ -22,7 +23,6 @@ Fri Dec 19 17:30:05 EET 2025
 * 07beab5 feat(scraper): implement simulation mode to bypass WAF during dev
 * 8d13095 chore(scripts): include git log in context dumper
 * 15c8316 refactor(api): connect routes to database via dependency injection
-* 84bff79 feat(db): implement SQLAlchemy ORM models and Repository pattern
 
 
 --- FILE STRUCTURE ---
@@ -48,6 +48,7 @@ Fri Dec 19 17:30:05 EET 2025
 │   ├── headers.txt
 │   └── page_utf8.html
 ├── forensics_dump.html
+├── forensics_engine.py
 ├── glashaus_context.txt
 ├── imot_simulation.html
 ├── manual_session_audit.py
@@ -56,6 +57,8 @@ Fri Dec 19 17:30:05 EET 2025
 ├── prompts
 │   └── detective_prompt_v1.md
 ├── requirements.txt
+├── risk_engine.py
+├── scraper_service.py
 ├── scripts
 │   └── context_dump.sh
 ├── src
@@ -94,7 +97,7 @@ Fri Dec 19 17:30:05 EET 2025
 │   └── test_api.py
 └── waf_challenge.html
 
-17 directories, 50 files
+17 directories, 53 files
 
 
 --- FILE CONTENTS ---
@@ -1875,6 +1878,69 @@ FILE: ./cookies.txt
 
 
 =========================================
+FILE: ./risk_engine.py
+=========================================
+class RiskEngine:
+    def calculate_risk_score(self, listing_data: dict, forensics_flags: list) -> dict:
+        score = 0
+        warnings = []
+        
+        area = listing_data.get('area', 0)
+        listing_type = listing_data.get('type', '')  # e.g., "2-СТАЕН"
+        price = listing_data.get('price', 0)
+        
+        # --- LOGIC FROM BATCH 2 (The "Space Hack") ---
+        # If it claims to be a 2-bedroom but is under 55 sqm
+        if "2-СТАЕН" in listing_type.upper() and area < 55:
+            score += 20
+            warnings.append({
+                "code": "SUSPICIOUS_AREA", 
+                "msg": f"Small area ({area} sqm) for a 2-bedroom. High risk of 'Space Hack' (Converted Studio)."
+            })
+            # If text confirms it, max out the risk
+            if "CONVERSION_RISK" in forensics_flags:
+                score += 30
+                warnings.append({"code": "CONFIRMED_CONVERSION", "msg": "Seller explicitly admits property is a converted studio (Garsoniera)."});
+
+        # --- LOGIC FROM BATCH 1 (The "Atelier") ---
+        if "ATELIER_STATUS" in forensics_flags:
+            score += 15
+            warnings.append({"code": "LEGAL_STATUS_ATELIER", "msg": "Property is legally an Atelier. Cannot register address easily, higher taxes."})
+
+        # --- LOGIC FROM BATCH 2 (The "Liquidity Trap") ---
+        # Check for flags like "LONG_WAIT_COMPLETION_2028"
+        future_flags = [f for f in forensics_flags if "LONG_WAIT" in f]
+        if future_flags:
+            score += 25
+            for f in future_flags:
+                year = f.split('_')[-1]
+                warnings.append({"code": "LIQUIDITY_TRAP", "msg": f"Construction finishes in {year}. Capital locked for years."})
+
+        # --- LOGIC FROM BATCH 1 (VAT Trap) ---
+        if "VAT_EXCLUDED" in forensics_flags:
+            # Not a 'risk' per se, but a financial shock
+            real_price = price * 1.2
+            warnings.append({"code": "HIDDEN_COST", "msg": f"Advertised price excludes VAT. Real price is ~{real_price:,.0f} EUR."})
+            
+        # --- Ground Floor Logic ---
+        if "GROUND_FLOOR_RISK" in forensics_flags:
+            score += 10
+            warnings.append({"code": "GROUND_FLOOR", "msg": "Property is on the ground floor. Security and privacy risks."})
+
+        verdict = "CLEAN"
+        if score > 50:
+            verdict = "CRITICAL"
+        elif score > 20:
+            verdict = "WARNING"
+
+        return {
+            "risk_score": min(score, 100),
+            "verdict": verdict,
+            "details": warnings
+        }
+
+
+=========================================
 FILE: ./forensics/headers.txt
 =========================================
 HTTP/2 200 
@@ -2849,3 +2915,218 @@ if __name__ == "__main__":
     # YOU NEED TO FILL THIS FROM YOUR BROWSER
     MY_COOKIE = "imot_session_redirect=...; sid=...;" 
     manual_audit("https://www.imot.bg/pcgi/imot.cgi?act=5&adv=1c171899111", MY_COOKIE)
+
+
+=========================================
+FILE: ./forensics_engine.py
+=========================================
+import re
+from datetime import datetime
+
+class ListingForensics:
+    def __init__(self):
+        self.current_year = datetime.now().year
+        
+        # PATTERNS BASED ON REAL IMOT.BG DATA DUMPS
+        self.patterns = {
+            # VAT Trap: "Цената е без ДДС" or "Не се начислява ДДС"
+            "vat_excluded": r"(?i)(цената е без ддс|без ддс|vat excluded|no vat|не се начислява ддс)",
+            
+            # Broker Filter: "Само за частни лица", "Колеги не"
+            "private_only": r"(?i)(само за частни лица|частни лица|без агенции|колеги не)",
+            
+            # Space Hack: "Преустроена гарсониера", "Маломерен"
+            "space_hack": r"(?i)(преустроена? гарсониера|усвоен.*?балкон|кухня.*?коридор|бивша.*?кухня|маломерен|боксониера)",
+            
+            # Legal Status: "Atelier", "Studio"
+            "atelier_statute": r"(?i)(статут.*?ателие|статут на ателие|студио|творческо ателие)",
+            
+            # Floor Risks: "Parter", "Garage"
+            "ground_floor": r"(?i)(партер|етаж 1 от|висок партер|кота 0|сутерен)",
+            
+            # Liquidity Trap: "Act 16 in 2028"
+            "payment_scheme": r"(?i)(\d{1,2}%.*?сега|\d{1,2}%.*?предварителен|\d{1,2}%.*?акт 16)",
+            
+            # Extract future years like "2026 г.", "2028"
+            "future_year": r"(\d{4})\s?г\."
+        }
+
+    def analyze_text(self, description: str, title: str):
+        """
+        Scans the raw text for hidden flags that structured data misses.
+        """
+        flags = []
+        text_combined = f"{title} {description}"
+
+        # 1. VAT Check
+        if re.search(self.patterns["vat_excluded"], text_combined):
+            flags.append("VAT_EXCLUDED")
+
+        # 2. Broker/Private Filter
+        if re.search(self.patterns["private_only"], text_combined):
+            flags.append("DIRECT_CLIENT_ONLY")
+
+        # 3. Space Hack / Conversion
+        if re.search(self.patterns["space_hack"], text_combined):
+            flags.append("CONVERSION_RISK")
+
+        # 4. Legal Statute
+        if re.search(self.patterns["atelier_statute"], text_combined):
+            flags.append("ATELIER_STATUS")
+            
+        # 5. Ground Floor
+        if re.search(self.patterns["ground_floor"], text_combined):
+            flags.append("GROUND_FLOOR_RISK")
+
+        # 6. Future Completion (Liquidity Trap)
+        years = re.findall(self.patterns["future_year"], text_combined)
+        if years:
+            # Filter distinct reasonable years (e.g. 2024-2030)
+            valid_years = [int(y) for y in years if 2020 < int(y) < 2040]
+            if valid_years:
+                max_year = max(valid_years)
+                if max_year > self.current_year + 2:
+                    flags.append(f"LONG_WAIT_COMPLETION_{max_year}")
+                elif max_year > self.current_year:
+                    flags.append("UNDER_CONSTRUCTION")
+
+        return flags
+
+    def normalize_price(self, price_raw: float, flags: list) -> float:
+        """
+        Returns the REAL price the buyer will pay.
+        """
+        if "VAT_EXCLUDED" in flags:
+            return price_raw * 1.20  # Add 20% VAT
+        return price_raw
+
+
+=========================================
+FILE: ./scraper_service.py
+=========================================
+import re
+import json
+from bs4 import BeautifulSoup
+from forensics_engine import ListingForensics
+from risk_engine import RiskEngine
+
+class ScraperService:
+    def __init__(self):
+        self.forensics = ListingForensics()
+        self.risk_engine = RiskEngine()
+
+    def parse_imot_bg_html(self, html_content: str, url: str = ""):
+        """
+        Parses raw HTML from imot.bg and runs the full forensic audit.
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # 1. Basic Extraction
+        try:
+            title_tag = soup.find('h1')
+            title = title_tag.text.strip() if title_tag else "Unknown"
+            
+            # Price extraction (handles "139 000 €")
+            price_tag = soup.find(id='price')
+            price_text = price_tag.text.strip() if price_tag else "0"
+            price_clean = re.sub(r'[^\d]', '', price_text)
+            price = float(price_clean) if price_clean else 0.0
+            
+            # Description extraction
+            desc_tag = soup.find(id='description_div')
+            description = desc_tag.text.strip() if desc_tag else ""
+            
+            # Specification extraction (Area, Floor, Type)
+            # Imot.bg usually puts these in an 'info' block or params
+            # We look for "Площ:" text
+            area = 0
+            floor = ""
+            construction = ""
+            
+            # Simple text scanning for demo purposes (imot.bg structure varies)
+            full_text = soup.get_text()
+            
+            area_match = re.search(r'Площ:\s*(\d+)', full_text)
+            if area_match:
+                area = int(area_match.group(1))
+                
+            floor_match = re.search(r'Етаж:\s*(.*)', full_text)
+            if floor_match:
+                floor = floor_match.group(1).split('\n')[0].strip()
+                
+            type_match = re.search(r'Вид имот:\s*(.*)', full_text)
+            listing_type = "2-СТАЕН" if "2-СТАЕН" in title.upper() else "UNKNOWN"
+
+        except Exception as e:
+            return {"error": f"Parsing failed: {str(e)}"}
+
+        # 2. Forensic Analysis
+        flags = self.forensics.analyze_text(description, title)
+        
+        # Check for VAT field specifically in HTML (sometimes outside description)
+        if "Не се начислява ДДС" in full_text and "VAT_EXCLUDED" not in flags:
+             # Actually "Не се начислява ДДС" usually means NO VAT is owed (Private seller)
+             # But "Цената е без ДДС" means +20%. 
+             # Let's trust the forensics engine regex for the tricky ones.
+             pass
+
+        # 3. Normalize Price
+        real_price = self.forensics.normalize_price(price, flags)
+
+        # 4. Risk Calculation
+        listing_data = {
+            "type": listing_type,
+            "area": area,
+            "price": price,
+            "floor": floor
+        }
+        
+        risk_report = self.risk_engine.calculate_risk_score(listing_data, flags)
+
+        # 5. Construct Final Output
+        return {
+            "meta": {
+                "url": url,
+                "parsed_at": "now"
+            },
+            "basic_info": {
+                "title": title,
+                "advertised_price": price,
+                "real_price_estimate": real_price,
+                "area": area,
+                "floor": floor
+            },
+            "forensics": {
+                "detected_flags": flags,
+                "risk_audit": risk_report
+            },
+            "ai_summary": self.generate_summary(risk_report, real_price, area)
+        }
+
+    def generate_summary(self, risk_report, price, area):
+        if risk_report['verdict'] == "CRITICAL":
+            return "DO NOT BUY. This property has critical red flags."
+        if risk_report['verdict'] == "WARNING":
+            return "PROCEED WITH CAUTION. Significant discrepancies detected."
+        return "Low risk detected based on automated audit."
+
+# --- SIMULATION BLOCK (For testing) ---
+if __name__ == "__main__":
+    # Simulating the Lyulin 4 "Garsoniera" from the user dump
+    mock_html = """
+    <html>
+        <h1>Продава 2-СТАЕН, град София, Люлин 4</h1>
+        <div id="price">139 000 €</div>
+        <div>Площ: 47 m2</div>
+        <div>Етаж: 3-ти от 8</div>
+        <div id="description_div">
+            Продава маломерен двустаен, преустроена гарсониера. 
+            Жилището е след лукс ремонт. Най-добрият етаж.
+        </div>
+        <div>Не се начислява ДДС</div>
+    </html>
+    """
+    
+    service = ScraperService()
+    result = service.parse_imot_bg_html(mock_html, "http://test.url")
+    print(json.dumps(result, indent=2, ensure_ascii=False))

@@ -1,7 +1,7 @@
 openapi: 3.0.0
 info:
   title: Glashaus API
-  version: 0.1.0
+  version: 1.0.0
 paths:
   /audit/url:
     post:
@@ -17,7 +17,24 @@ paths:
                   format: uri
       responses:
         '200':
-          description: Audit Complete
+          description: Audit Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  listing_id:
+                    type: integer
+                  status:
+                    type: string
+                    example: "QUEUED_IN_REDIS"
+
+  /reports/{listing_id}:
+    get:
+      summary: Retrieve Forensic Report & Risk Score
+      responses:
+        '200':
+          description: Detailed Audit Report
           content:
             application/json:
               schema:
@@ -25,11 +42,43 @@ paths:
                 properties:
                   report_id:
                     type: integer
+                  status:
+                    type: string
+                    enum: [PENDING, PROCESSING, VERIFIED, MANUAL_REVIEW, REJECTED]
                   risk_score:
                     type: integer
-                  verified_address:
+                    description: 0-100 (100 is Toxic/Fatal)
+                  cost:
+                    type: float
+                  manual_notes:
                     type: string
-                  ai_reasoning:
-                    type: array
-                    items:
-                      type: string
+                  discrepancies:
+                    type: object
+                    properties:
+                      flags:
+                        type: array
+                        items: 
+                          type: string
+                        example: ["CRITICAL: Property is listed for EXPROPRIATION.", "LEGAL: Atelier status."]
+                      forensics:
+                        type: object
+                        properties:
+                          city_risk:
+                            type: object
+                            properties:
+                              is_expropriated: 
+                                type: boolean
+                              registry_status:
+                                type: string
+                          compliance:
+                            type: object
+                            properties:
+                              has_act16:
+                                type: boolean
+                          cadastre:
+                            type: object
+                            properties:
+                              official_area:
+                                type: number
+                              diff_percent:
+                                type: number
