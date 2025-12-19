@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Fri Dec 19 19:45:51 EET 2025
+Fri Dec 19 20:07:21 EET 2025
 
 
 --- GIT HISTORY ---
-* a107438 (HEAD -> main) feat(core): implement forensic analysis and anti-manipulation logic
+* fdd6519 (HEAD -> main) docs: update architecture, API contract, and debt log to match V1 state
+* a107438 feat(core): implement forensic analysis and anti-manipulation logic
 * 2f79d2e removed junk
 * ed4950e feat(forensics): harden backend with LexSofia logic and municipal registry strikes
 * 00b1e10 feat(reporting): integrate forensic registry checks into Legal Brief generation
@@ -22,7 +23,6 @@ Fri Dec 19 19:45:51 EET 2025
 * d266a4d ops: add docker containerization and orchestration
 * 07beab5 feat(scraper): implement simulation mode to bypass WAF during dev
 * 8d13095 chore(scripts): include git log in context dumper
-* 15c8316 refactor(api): connect routes to database via dependency injection
 
 
 --- FILE STRUCTURE ---
@@ -108,22 +108,38 @@ FILE: ./docs/ARCHITECTURE.md
 =========================================
 # System Architecture
 
-## Core Logic Flow (Cost Optimized)
-1. **Ingest:** Scraper Service fetches URL.
-2. **Analysis Tier 1 (Cheap):** Text Extraction (Gemini Flash).
-   - *Goal:* Find Address in text.
-   - *Cost:* ~$0.04/run.
-3. **Gatekeeper:** Confidence Check (>90%).
-4. **Analysis Tier 2 (Expensive):** Visual Detective (Gemini Pro).
-   - *Trigger:* Only if Tier 1 fails.
-   - *Goal:* Identify building via Facade/Landmarks/Geofencing.
-   - *Cost:* ~$0.22/run.
-5. **Verification:** Cross-reference extracted Address vs Cadastre API.
+## Core Logic Flow (Forensic Loop)
+The system uses an Event-Driven architecture to orchestrate parallel forensic checks.
+
+1. **Ingest & Normalize:** - Scraper Service fetches URL (handling `windows-1251` encoding).
+   - URLs are normalized (mobile subdomain enforcement) and deduplicated via content hash.
+   
+2. **The "Forensic Audit" Task (Celery Worker):**
+   Unlike the initial design, the system now runs a **consolidated parallel audit** rather than a tiered fallback.
+   
+   - **Step A: Text Analysis (Gemini Flash):** Extracts unstructured data (Address, Construction Year, Atelier status).
+   - **Step B: Official Registry Checks (Async/Parallel):**
+     - **Cadastre Service:** Verifies official area vs advertised area using the extracted address.
+     - **City Risk Service (NAG):** Checks Sofia Municipal records for Expropriation (seizure) risks.
+     - **Compliance Service:** Verifies "Act 16" (Commissioning Certificate) status against the cadastral ID.
+   - **Step C: Risk Engine V2:**
+     - Merges all data points to calculate a composite `Risk Score` (0-100).
+     - Identifies "Fatal" flags (e.g., Expropriation = 100% Risk).
+
+3. **Report Generation:** - `AttorneyReportGenerator` synthesizes a human-readable legal brief from the structured forensic data.
 
 ## Tech Stack
-- **Lang:** Python (FastAPI) or Java (Spring Boot) - TBD
-- **DB:** PostgreSQL + PostGIS (Geospatial extensions)
-- **Queue:** Redis (Task offloading)
+- **Service Layer:** Python 3.11 (FastAPI)
+- **Asynchronous Task Queue:** Celery + Redis
+- **Database:** PostgreSQL + PostGIS (Spatial data)
+- **Resilience:** Circuit Breakers implemented for Government Registry downtime (handling `httpx.ConnectError`).
+
+## Critical Components
+| Component | Function | Status |
+| :--- | :--- | :--- |
+| **Risk Engine** | Calculates score based on Area Fraud, Legal Status (Atelier), and Expropriation. | ✅ Implemented (V2) |
+| **Forensics Service** | Manages sessions with `nag.sofia.bg` and `kais.cadastre.bg`. | ✅ Implemented |
+| **Storage Service** | Archives listing images to disk/S3 for evidence preservation. | ✅ Implemented |
 
 
 =========================================
@@ -132,7 +148,7 @@ FILE: ./docs/api_contract.yaml
 openapi: 3.0.0
 info:
   title: Glashaus API
-  version: 0.1.0
+  version: 1.0.0
 paths:
   /audit/url:
     post:
@@ -148,7 +164,24 @@ paths:
                   format: uri
       responses:
         '200':
-          description: Audit Complete
+          description: Audit Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  listing_id:
+                    type: integer
+                  status:
+                    type: string
+                    example: "QUEUED_IN_REDIS"
+
+  /reports/{listing_id}:
+    get:
+      summary: Retrieve Forensic Report & Risk Score
+      responses:
+        '200':
+          description: Detailed Audit Report
           content:
             application/json:
               schema:
@@ -156,14 +189,46 @@ paths:
                 properties:
                   report_id:
                     type: integer
+                  status:
+                    type: string
+                    enum: [PENDING, PROCESSING, VERIFIED, MANUAL_REVIEW, REJECTED]
                   risk_score:
                     type: integer
-                  verified_address:
+                    description: 0-100 (100 is Toxic/Fatal)
+                  cost:
+                    type: float
+                  manual_notes:
                     type: string
-                  ai_reasoning:
-                    type: array
-                    items:
-                      type: string
+                  discrepancies:
+                    type: object
+                    properties:
+                      flags:
+                        type: array
+                        items: 
+                          type: string
+                        example: ["CRITICAL: Property is listed for EXPROPRIATION.", "LEGAL: Atelier status."]
+                      forensics:
+                        type: object
+                        properties:
+                          city_risk:
+                            type: object
+                            properties:
+                              is_expropriated: 
+                                type: boolean
+                              registry_status:
+                                type: string
+                          compliance:
+                            type: object
+                            properties:
+                              has_act16:
+                                type: boolean
+                          cadastre:
+                            type: object
+                            properties:
+                              official_area:
+                                type: number
+                              diff_percent:
+                                type: number
 
 
 =========================================
@@ -206,43 +271,34 @@ FILE: ./docs/TECHNICAL_DEBT.md
 
 ## Critical Severity (Must Fix Before Beta)
 
-### 1. Database Session Scope in Background Tasks
-- **Location:** `src/api/routes.py` -> `initiate_audit`
-- **Issue:** Passing the dependency-injected `db` session to `BackgroundTasks` causes `DetachedInstanceError` because the session closes when the HTTP response returns.
-- **Fix:** Refactor `process_audit_task` to instantiate a fresh `SessionLocal()` context manager internally.
-- **Reference:** SQLAlchemy Thread-Safety docs.
-
-### 2. AI Service Implementation
-- **Location:** `src/services/ai_engine.py`
-- **Issue:** Currently returns mock dictionary `{"confidence": 0.0}`.
-- **Fix:** 
-    - Initialize `genai.configure(api_key=...)`.
-    - Implement `generate_content` call for Gemini Flash (Text).
-    - Implement `generate_content` with Image inputs for Gemini Pro (Vision).
-    - Add Error Handling for "Safety Filters" or API Quotas.
-
-## Moderate Severity (Logic Gaps)
-
-### 3. Risk Scoring Algorithm
-- **Location:** Database Schema exists (`risk_score`), but logic is missing.
-- **Issue:** No calculator exists to translate discrepancies into a 0-100 integer.
-- **Fix:** Create `src/services/risk_engine.py`.
-    - Base Score: 0
-    - If `advertised_area` > `cadastre_area` (+20 pts).
-    - If `type` mismatch (Atelier vs Apt) (+30 pts).
-    - If `price_per_sqm` > 1.5x avg (+15 pts).
-
-### 4. Hardcoded Secrets
+### 1. Hardcoded Secrets (Config)
 - **Location:** `src/core/config.py`
-- **Issue:** Default "mock-key" risks silent failure in prod.
-- **Fix:** Implement `pydantic` validation to raise `ValueError` on startup if `GEMINI_API_KEY` is missing in production environment.
+- **Issue:** `GEMINI_API_KEY` defaults to "mock-key". While validated at runtime, this is bad practice.
+- **Fix:** Remove default value entirely and force `.env` loading.
 
-## Low Severity (Optimization)
+### 2. Scraper Fragility (DOM Coupling)
+- **Location:** `src/services/scraper_service.py` & `forensic_check.py`
+- **Issue:** Logic relies on specific HTML IDs (e.g., `id='price'`, `id='description_div'`).
+- **Risk:** High. If `imot.bg` updates their frontend classes, the "Space Hack" and Price normalization logic will fail silently.
+- **Fix:** Implement multi-selector fallbacks or move strictly to Visual DOM analysis (Gemini Vision) for extraction.
 
-### 5. Listing Normalization
-- **Location:** `src/services/repository.py`
-- **Issue:** Duplicate URLs might occur if query params differ (e.g., `?adv=1` vs `?adv=1&utm=facebook`).
-- **Fix:** Implement a URL cleaner utility to strip tracking parameters before hashing/storing.
+## Moderate Severity (Optimization)
+
+### 3. Synchronous Registry Calls in Loops
+- **Location:** `src/services/forensics_service.py`
+- **Issue:** While the task itself is async, some specialized sub-checks might still block the event loop if not strictly awaited.
+- **Fix:** Audit all `httpx` calls to ensure `await` is used consistently across the `gather()` chain.
+
+## Resolved Items (Fixed)
+
+### ✅ Database Session Scope in Background Tasks
+- **Fix:** `src/tasks.py` now explicitly initializes a thread-safe session using `with SessionLocal() as db:` inside the Celery worker.
+
+### ✅ Risk Scoring Algorithm
+- **Fix:** `RiskEngine` (V2) is implemented (`src/services/risk_engine.py`). It now calculates scores based on Expropriation (Fatal), Act 16 status, and Area discrepancy > 25%.
+
+### ✅ Listing Normalization
+- **Fix:** `RealEstateRepository` now normalizes URLs (forcing mobile subdomains) and checks for duplicates before insertion.
 
 
 =========================================

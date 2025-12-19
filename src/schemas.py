@@ -1,0 +1,49 @@
+from pydantic import BaseModel, HttpUrl, Field, condecimal
+from typing import List, Optional, Literal, Dict, Any
+from datetime import datetime
+
+# 1. Scraper Layer
+class ScrapedListing(BaseModel):
+    source_url: str
+    raw_text: str
+    price_predicted: condecimal(max_digits=12, decimal_places=2) = Field(..., description="Normalized price in BGN")
+    area_sqm: float
+    image_urls: List[str] = []
+
+# 2. Forensic/AI Layer
+class AIAnalysisResult(BaseModel):
+    address_prediction: str
+    neighborhood: str
+    is_atelier: bool
+    net_living_area: float
+    construction_year: int
+    confidence_score: int = Field(default=0, ge=0, le=100)
+
+# 3. Registry Layer
+class RegistryCheck(BaseModel):
+    registry_status: Literal["LIVE", "OFFLINE", "ERROR"] = "LIVE"
+    details: str = ""
+    is_risk_detected: bool = False
+    checked: bool = False
+
+class CadastreData(BaseModel):
+    official_area: float = 0.0
+    cadastre_id: Optional[str] = None
+    status: Literal["LIVE", "OFFLINE", "NOT_FOUND", "ERROR"] = "NOT_FOUND"
+    address_found: Optional[str] = None
+
+# 4. Risk Engine Layer
+class RiskAssessment(BaseModel):
+    score: int = Field(default=0, ge=0, le=100)
+    verdict: Literal["CLEAN", "WARNING", "CRITICAL", "FATAL"] = "CLEAN"
+    flags: List[str] = []
+    is_fatal: bool = False
+
+# 5. Master Object (Passed to Report Generator)
+class ConsolidatedAudit(BaseModel):
+    scraped: ScrapedListing
+    ai: AIAnalysisResult
+    cadastre: CadastreData
+    compliance: RegistryCheck  # Act 16
+    city_risk: RegistryCheck   # Expropriation
+    risk_assessment: RiskAssessment

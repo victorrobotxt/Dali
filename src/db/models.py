@@ -1,5 +1,5 @@
 import enum
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, ForeignKey, JSON, Text, Enum
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, ForeignKey, JSON, Text, Enum, Numeric
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from src.db.session import Base
@@ -16,7 +16,9 @@ class Listing(Base):
     id = Column(Integer, primary_key=True, index=True)
     source_url = Column(String, unique=True, nullable=False, index=True)
     content_hash = Column(String(64), index=True)
-    price_bgn = Column(Float)
+    
+    # FINANCIAL FIX: Use Numeric for precise currency handling
+    price_bgn = Column(Numeric(12, 2)) 
     advertised_area_sqm = Column(Float)
     description_raw = Column(Text)
     scraped_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -29,7 +31,6 @@ class Building(Base):
     id = Column(Integer, primary_key=True)
     cadastre_id = Column(String, unique=True, index=True)
     address_full = Column(String)
-    # Using float for now for Termux compatibility, Geometry(POINT) for Prod
     latitude = Column(Float)
     longitude = Column(Float)
     construction_year = Column(Integer)
@@ -39,7 +40,7 @@ class PriceHistory(Base):
     __tablename__ = "price_history"
     id = Column(Integer, primary_key=True)
     listing_id = Column(Integer, ForeignKey("listings.id"))
-    price_bgn = Column(Float)
+    price_bgn = Column(Numeric(12, 2))
     changed_at = Column(DateTime(timezone=True), server_default=func.now())
     listing = relationship("Listing", back_populates="price_history")
 
@@ -54,7 +55,11 @@ class Report(Base):
     legal_brief = Column(Text)
     discrepancy_details = Column(JSON)
     image_archive_urls = Column(JSON)
-    cost_to_generate = Column(Float)
+    
+    # COST FIX: Track API usage precisely
+    cost_to_generate = Column(Numeric(10, 4)) 
+    
+    manual_review_notes = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     listing = relationship("Listing", back_populates="reports")
     building = relationship("Building", back_populates="reports")
