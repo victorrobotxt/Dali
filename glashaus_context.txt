@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Fri Dec 19 23:02:09 EET 2025
+Sun Dec 28 17:32:34 EET 2025
 
 
 --- GIT HISTORY ---
-* 27d7a7c (HEAD -> main) feat(forensics): implement legal RAG and geospatial triangulation
+* f0c6488 (HEAD -> main) update docs and remove junk files
+* 27d7a7c feat(forensics): implement legal RAG and geospatial triangulation
 * 52420e1 refactor(core): implement hybrid scraping fallback and multimodal AI forensics Key Changes in this Commit:  * Multimodal AI Integration: Upgraded the GeminiService to use gemini-1.5-flash, enabling vision-based forensics by processing listing images alongside text.  * Forensic Property Analysis: Implemented a "Senior Real Estate Forensic Detective" prompt to detect "Atelier" status traps, identify architectural eras (e.g., Pre-1989 Panel vs. Post-2000 Brick), and perform orientation checks.  * Geospatial Verification: Added a new GeospatialService that uses the Google Maps Geocoding API to cross-reference AI-detected landmarks and addresses against the neighborhood claimed by the broker.  * Location Fraud Detection: The audit pipeline now automatically elevates risk scores (minimum of 70) if the geospatial verification finds a mismatch between the ad and visual evidence.  * Enhanced Scraper: Updated ScraperService to better extract neighborhood data and handle image URLs from imot.bg more reliably.
 * 698eb25 refactor(core): implement hybrid scraping fallback and multimodal AI forensics
 * 6f470a6 refactor(core): production hardening, type safety, and architecture cleanup
@@ -22,11 +23,15 @@ Fri Dec 19 23:02:09 EET 2025
 * f639780 feat(legal): implement legal forensic engine and solicitor report generation
 * 6489783 feat(core): harden task resilience, abstract providers, and add storage layer
 * a087b30 feat(backend): implement vision layer, harden worker logic, and add regex parsing
-* 4987d66 feat(infra): add Nginx gateway, CORS, and live scraping logic
 
 
 --- FILE STRUCTURE ---
 .
+‚îú‚îÄ‚îÄ --data-urlencode
+‚îú‚îÄ‚îÄ -G
+‚îú‚îÄ‚îÄ -H
+‚îú‚îÄ‚îÄ -X
+‚îú‚îÄ‚îÄ -d
 ‚îú‚îÄ‚îÄ Dockerfile
 ‚îú‚îÄ‚îÄ README.md
 ‚îú‚îÄ‚îÄ alembic.ini
@@ -58,6 +63,7 @@ Fri Dec 19 23:02:09 EET 2025
 ‚îú‚îÄ‚îÄ scraper_service.py
 ‚îú‚îÄ‚îÄ scripts
 ‚îÇ¬†¬† ‚îú‚îÄ‚îÄ context_dump.sh
+‚îÇ¬†¬† ‚îú‚îÄ‚îÄ debug_kais.py
 ‚îÇ¬†¬† ‚îî‚îÄ‚îÄ scrape_lex.py
 ‚îú‚îÄ‚îÄ src
 ‚îÇ¬†¬† ‚îú‚îÄ‚îÄ __init__.py
@@ -95,7 +101,7 @@ Fri Dec 19 23:02:09 EET 2025
 ‚îî‚îÄ‚îÄ tests
     ‚îî‚îÄ‚îÄ test_api.py
 
-16 directories, 52 files
+16 directories, 58 files
 
 
 --- FILE CONTENTS ---
@@ -111,10 +117,9 @@ The system uses an Event-Driven architecture to orchestrate parallel forensic ch
 
 1. **Ingest & Normalize:** - Scraper Service fetches URL (handling `windows-1251` encoding).
    - URLs are normalized (mobile subdomain enforcement) and deduplicated via content hash.
-   
+
 2. **The "Forensic Audit" Task (Celery Worker):**
    Unlike the initial design, the system now runs a **consolidated parallel audit** rather than a tiered fallback.
-   
    - **Step A: Text Analysis (Gemini Flash):** Extracts unstructured data (Address, Construction Year, Atelier status).
    - **Step B: Official Registry Checks (Async/Parallel):**
      - **Cadastre Service:** Verifies official area vs advertised area using the extracted address.
@@ -138,6 +143,38 @@ The system uses an Event-Driven architecture to orchestrate parallel forensic ch
 | **Risk Engine** | Calculates score based on Area Fraud, Legal Status (Atelier), and Expropriation. | ‚úÖ Implemented (V2) |
 | **Forensics Service** | Manages sessions with `nag.sofia.bg` and `kais.cadastre.bg`. | ‚úÖ Implemented |
 | **Storage Service** | Archives listing images to disk/S3 for evidence preservation. | ‚úÖ Implemented |
+
+## Database Schema (Live State)
+*Synced with `src/db/models.py` and Alembic Migrations 001-003.*
+
+### 1. Listings Table
+| Column | Type | Description |
+| :--- | :--- | :--- |
+| `id` | Integer | PK |
+| `source_url` | String | Unique Index |
+| `content_hash` | String(64) | **Idempotency**: SHA256(text + price) |
+| `price_bgn` | **Numeric(12,2)** | Financial precision (e.g., 150000.00) |
+| `advertised_area_sqm` | **Numeric(10,2)** | Area precision (e.g., 65.50) |
+| `description_raw` | Text | Full ad body |
+
+### 2. Reports Table
+| Column | Type | Description |
+| :--- | :--- | :--- |
+| `id` | Integer | PK |
+| `listing_id` | Integer | FK -> Listings |
+| `status` | Enum | `PENDING`, `PROCESSING`, `VERIFIED`, `MANUAL_REVIEW`, `REJECTED` |
+| `risk_score` | Integer | 0-100 (100 = Fatal) |
+| `ai_confidence_score` | Integer | 0-100 (Hallucination check) |
+| `cost_to_generate` | **Numeric(10,4)** | API Cost tracking (e.g., 0.0045 BGN) |
+| `discrepancy_details` | JSON | Specific flags (e.g. "Area mismatch > 25%") |
+
+### 3. Buildings Table (Registry Truth)
+| Column | Type | Description |
+| :--- | :--- | :--- |
+| `id` | Integer | PK |
+| `cadastre_id` | String | Unique Official ID |
+| `construction_year` | Integer | Registry confirmed year |
+| `latitude/longitude` | Float | Geocoded coordinates |
 
 
 =========================================
@@ -529,37 +566,6 @@ class ForensicPatterns:
             
         return flags
 
-
-=========================================
-FILE: ./src/core/__pycache__/sofia_data.cpython-312.pyc
-=========================================
-À
-    
-Eiü  „                   Û:   ó d ddúd ddúdddúdddúdddúdddúdúZ y	)
-È   ⁄Critical)⁄
-strictness⁄kindergarten_risk⁄HighÈ   ⁄ModerateÈ   ⁄Low)⁄	OBORISHTE⁄PODUYANE⁄CENTER⁄LOZENETS⁄VITOSHAzKRUSTOVA VADAN)⁄SOFIA_ADMIN_MAP© Û    ˙@/data/data/com.termux/files/home/glashaus/src/core/sofia_data.py⁄<module>r      s<   ‡ !∏
-—Cÿ ∞v—>ÿ∞V—<ÿ ∞z—Bÿ∞e—<ÿ$%∏E—BÒÅr   
-
-=========================================
-FILE: ./src/core/__pycache__/patterns.cpython-312.pyc
-=========================================
-À
-    /öEiD  „                   Û,   ó d dl Z d dlmZ  G dÑ d´      Zy)È    N)⁄Listc                   Û˛   ó e Zd ZdZ ej
-                  d´      Z ej
-                  d´      Z ej
-                  d´      Z ej
-                  d´      Z	 ej
-                  d´      Z
-ededefd	Ñ´       Zededee   fd
-Ñ´       Zy)⁄ForensicPatternsz7
-    Centralized regex registry for text analysis.
-    ui   (?i)(—Ü–µ–Ω–∞—Ç–∞ –µ –±–µ–∑ –¥–¥—Å|–±–µ–∑ –¥–¥—Å|vat excluded|no vat|–Ω–µ —Å–µ –Ω–∞—á–∏—Å–ª—è–≤–∞ –¥–¥—Å)uª   (?i)(–ø—Ä–µ—É—Å—Ç—Ä–æ–µ–Ω–∞? –≥–∞—Ä—Å–æ–Ω–∏–µ—Ä–∞|—É—Å–≤–æ–µ–Ω.*?–±–∞–ª–∫–æ–Ω|–∫—É—Ö–Ω—è.*?–∫–æ—Ä–∏–¥–æ—Ä|–±–∏–≤—à–∞.*?–∫—É—Ö–Ω—è|–º–∞–ª–æ–º–µ—Ä–µ–Ω|–±–æ–∫—Å–æ–Ω–∏–µ—Ä–∞|—Ç–∞–≤–∞–Ω—Å–∫–æ)uu   (?i)(—Å—Ç–∞—Ç—É—Ç.*?–∞—Ç–µ–ª–∏–µ|—Å—Ç–∞—Ç—É—Ç –Ω–∞ –∞—Ç–µ–ª–∏–µ|—Å—Ç—É–¥–∏–æ|—Ç–≤–æ—Ä—á–µ—Å–∫–æ –∞—Ç–µ–ª–∏–µ|atelier)uT   (?i)(–ø–∞—Ä—Ç–µ—Ä|–µ—Ç–∞–∂ 1 –æ—Ç|–≤–∏—Å–æ–∫ –ø–∞—Ä—Ç–µ—Ä|–∫–æ—Ç–∞ 0|—Å—É—Ç–µ—Ä–µ–Ω)uT   (?i)(\d{1,2}%.*?—Å–µ–≥–∞|\d{1,2}%.*?–ø—Ä–µ–¥–≤–∞—Ä–∏—Ç–µ–ª–µ–Ω|\d{1,2}%.*?–∞–∫—Ç 16)⁄text⁄returnc                 Ûn   ó |syt        j                  dd|´      j                  ´       j                  ´       S )z%Standardize text to catch edge cases.⁄ z\s+⁄ )⁄re⁄sub⁄strip⁄upper)⁄clsr   s     ˙>/data/data/com.termux/files/home/glashaus/src/core/patterns.py⁄normalize_textzForensicPatterns.normalize_text   s.   Ä Ò òB‹èvâvêfòc†4”(◊.—.”0◊6—6”8–8Û    c                 Ûr  ó g }|s|S | j                   j                  |´      r|j                  d´       | j                  j                  |´      r|j                  d´       | j                  j                  |´      r|j                  d´       | j
-                  j                  |´      r|j                  d´       |S )N⁄VAT_EXCLUDED⁄CONVERSION_RISK⁄ATELIER_DETECTED⁄GROUND_FLOOR_RISK)r   ⁄search⁄append⁄
-SPACE_HACK⁄ATELIER_STATUTE⁄GROUND_FLOOR)r   r   ⁄flagss      r   ⁄extract_flagszForensicPatterns.extract_flags   sî   Ä ‡àŸòEê\‡◊—◊"—"†4‘(ÿèLâLò‘(ÿè>â>◊ — †‘&ÿèLâL–*‘+ÿ◊—◊%—%†d‘+ÿèLâL–+‘,ÿ◊—◊"—"†4‘(ÿèLâL–,‘-‡àr   N)⁄__name__⁄
-__module__⁄__qualname__⁄__doc__r   ⁄compiler   r   r   r   ⁄FUTURE_COMPLETION⁄classmethod⁄strr   r   r   © r   r   r   r      s∑   Ñ Ò ê2ó:ë:  KÛ  LÄLÿêóë  [Û  \ÄJÿ êbójëj  "ZÛ  [ÄOÿê2ó:ë:–u”vÄLÿ"òü
-ô
-–#z”{–‡9†# 9®#Ú 9Û 9
- † ®®c©Ú Û Òr   r   )r   ⁄typingr   r   r'   r   r   ⁄<module>r)      s   € 	› ˜Ú r   
 
 =========================================
 FILE: ./src/services/ai_engine.py
@@ -1352,26 +1358,6 @@ class SofiaMunicipalForensics:
 
 
 =========================================
-FILE: ./src/services/__pycache__/legal_engine.cpython-312.pyc
-=========================================
-À
-    ∆¥Eiy	  „                   Ûf   ó d dl Z d dlZd dlmZmZ d dlmZ  G dÑ d´      Z e´       Z G dÑ d´      Z	y)È    N)⁄Optional⁄List)⁄ForensicPatternsc                   ÛT   ó e Zd ZdZddefdÑZdededee   fdÑZdded	ede	e   fd
-ÑZ
-y)⁄LegalKnowledgeBasez)Search engine for the local law database.⁄	laws_pathc                 Û   ó || _         y )N)r   )⁄selfr   s     ˙F/data/data/com.termux/files/home/glashaus/src/services/legal_engine.py⁄__init__zLegalKnowledgeBase.__init__   s	   Ä ÿ"àçÛ    ⁄law_name⁄article_num⁄returnc                 Ûû  ó t         j                  j                  | j                  |õ dù´      }t         j                  j	                  |´      syt        |dd¨´      5 }|j                  ´       }ddd´       d|õ dù}t        j                  |t        j                  ´      }|r|j                  d´      j                  ´       S dS # 1 sw Y   åWxY w)	z3Extracts a specific Article text from the law file.˙.txtN⁄r˙utf-8©⁄encodingu   (–ß–ª\. u   \..*?)(?=\n–ß–ª\. \d+|\Z)È   )⁄os⁄path⁄joinr   ⁄exists⁄open⁄read⁄re⁄search⁄DOTALL⁄group⁄strip)r
-   r   r   ⁄	file_path⁄f⁄content⁄pattern⁄matchs           r   ⁄get_articlezLegalKnowledgeBase.get_article   s†   Ä ‰óGëGóLëL†ß°∞H∞:∏T–1B”Cà	‹èwâwè~â~òi‘(ÿ‹ê)òS®7’3∞qÿófëfìhàG˜ 4 òkò]–*C–Dà‹ó	ë	ò'†7¨BØI©I”6àŸ).àuè{â{ò1ã~◊#—#”%–8∞D–8˜ 4–3˙s   ¡C√C⁄keyword⁄limitc           	      Û4  ó g }t         j                  j                  | j                  ´      s|S t        j                  | j                  ´      D ]º  }|j                  d´      såt        t         j                  j                  | j                  |´      dd¨´      5 }|j                  ´       }t        j                  d|õ dù|t        j                  ´      }|d| D ]'  }|j                  |j                  ´       õ d|õ d	ù´       å) 	 ddd´       åæ |S # 1 sw Y   å xY w)
-z0Finds sentences containing specific legal terms.r   r   r   r   z([^.\n]*z[^.\n]*)Nz (Ref: ⁄))r   r   r   r   ⁄listdir⁄endswithr   r   r   r   ⁄findall⁄
-IGNORECASE⁄appendr"   )	r
-   r)   r*   ⁄results⁄law_filer$   r%   ⁄matches⁄ms	            r   ⁄search_contextz!LegalKnowledgeBase.search_context   s€   Ä ‡à‹èwâwè~â~òdünôn‘-∞g®~‹ü
-ô
-†4ß>°>÷2àHÿ◊$—$†V‘,®h‹îbógëgólël†4ß>°>∞8”<∏c»G’T–XYÿü&ô&õ(ê‹ü*ô*®∞∞	∏–%B¿GÃRœ]…]”[êÿ ††%õêAÿóNëN†aßg°g£i†[∞∏∞z¿–#C’DÒ )˜ U–T 3 à˜ U–T˙s   ¬A)DƒD	N)zstorage/laws)r   )⁄__name__⁄
-__module__⁄__qualname__⁄__doc__⁄strr   ⁄intr   r(   r   r6   © r   r   r   r      sM   Ñ Ÿ3Ò#†#Û #9†C 9∞c 9∏h¿sπmÛ 9Ò†c ∞# ∏d¿3πiÙ r   r   c                   Û   ó e Zd ZdedefdÑZy)⁄LegalEngine⁄scraped_data⁄ai_datac                 Û  ó di dg dú}|j                  dd´      j                  ´       }t        j                  |´      }|d   j	                  |´       d}|j                  d´      sd|v rd	}|d   j                  d
-´       ||d   d<   ||d<   |S )Nr   ⁄CLEAR)⁄total_legal_score⁄pillars⁄gatekeeper_verdict⁄flags⁄raw_text⁄ rG   ⁄
-is_atelieru   –ê–¢–ï–õ–ò–ïÈ#   z(LEGAL: Non-residential status (Atelier).rE   ⁄classificationrD   )⁄get⁄upperr   ⁄extract_flags⁄extendr1   )r
-   r@   rA   ⁄risk_reportrH   ⁄regex_flags⁄p1_scores          r   ⁄analyze_listingzLegalEngine.analyze_listing)   sß   Ä ‡!"ÿÿ")ÿÒ	
-à  ◊#—#†J∞”3◊9—9”;à‹&◊4—4∞X”>àÿêG—◊#—#†K‘0‡àÿè;â;ê|‘$®∏(—(BÿàHÿò— ◊'—'–(R‘S‡3;àêI—–/—0ÿ+3à–'—(ÿ–r   N)r7   r8   r9   ⁄dictrT   r=   r   r   r?   r?   (   s   Ñ ®D ∏4Ù r   r?   )
-r   r   ⁄typingr   r   ⁄src.core.patternsr   r   ⁄kbr?   r=   r   r   ⁄<module>rY      s0   € 	€ 	ﬂ !› .˜Ò Ò@ ”Ä˜Ú r   
-
-=========================================
 FILE: ./src/__init__.py
 =========================================
 
@@ -1706,16 +1692,11 @@ class CadastreData(BaseModel):
 
 
 =========================================
-FILE: ./src/__pycache__/__init__.cpython-312.pyc
-=========================================
-À
-    û”Ci    „                    Û   ó y )N© r   Û    ˙9/data/data/com.termux/files/home/glashaus/src/__init__.py⁄<module>r      s   Òr   
-
-=========================================
 FILE: ./scripts/context_dump.sh
 =========================================
 #!/bin/bash
 # Scans the repo and dumps text files for LLM context
+
 output="glashaus_context.txt"
 echo "--- GLASHAUS PROJECT DUMP ---" > "$output"
 date >> "$output"
@@ -1724,12 +1705,19 @@ echo -e "\n\n--- GIT HISTORY ---" >> "$output"
 git log --oneline --graph --decorate -n 20 >> "$output"
 
 echo -e "\n\n--- FILE STRUCTURE ---" >> "$output"
+# Exclude git, pycache, and compiled python files from tree view
 tree -L 3 -I '.git|__pycache__|*.pyc' >> "$output" 2>/dev/null || find . -maxdepth 3 -not -path '*/.*' >> "$output"
 
 echo -e "\n\n--- FILE CONTENTS ---" >> "$output"
 find . -type f \
     -not -path '*/.*' \
+    -not -path '*/__pycache__*' \
+    -not -name '*.pyc' \
+    -not -name 'cookies.txt' \
     -not -path './glashaus_context.txt' \
+    -not -name 'bypass_audit.py' \
+    -not -name 'manual_session_audit.py' \
+    -not -path './scraper_service.py' \
     -not -name '*.png' \
     -not -name '*.jpg' \
     -not -name '*.sqlite' \
@@ -1740,7 +1728,7 @@ find . -type f \
     cat "$file" >> "$output"
 done
 
-echo "Dump complete. Copy contents of $output"
+echo "Dump complete. Clean contents saved to $output"
 
 
 =========================================
@@ -1827,6 +1815,96 @@ if __name__ == "__main__":
 
 
 =========================================
+FILE: ./scripts/debug_kais.py
+=========================================
+import requests
+from bs4 import BeautifulSoup
+import time
+import re
+
+# CONFIG
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+TARGET_QUERY = "–õ—é–ª–∏–Ω –±–ª 204"
+
+def run_debug():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "X-Requested-With": "XMLHttpRequest"
+    })
+
+    print("[1] HANDSHAKE...")
+    try:
+        resp = session.get("https://kais.cadastre.bg/bg/Map")
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        token = soup.find('input', {'name': '__RequestVerificationToken'}).get('value')
+    except Exception as e:
+        print(f"Handshake Failed: {e}")
+        return
+
+    print(f"[2] STRIKE: '{TARGET_QUERY}'...")
+    session.get("https://kais.cadastre.bg/bg/Map/FastSearch", params={"KeyWords": TARGET_QUERY})
+    time.sleep(0.5)
+
+    print("[3] READ: Extracting Data...")
+    headers = {"X-CSRF-TOKEN": token, "Referer": "https://kais.cadastre.bg/bg/Map"}
+    
+    resp = session.post(
+        "https://kais.cadastre.bg/bg/Map/ReadFoundObjects", 
+        data={"page": 1, "pageSize": 50}, 
+        headers=headers
+    )
+
+    data = resp.json()
+    objects = data.get("Data", [])
+    print(f"    -> Found {len(objects)} objects.")
+
+    # Filter for Independent Objects (SOS)
+    target_objects = [obj for obj in objects if obj.get('SubType') == '–°–û–°' or (obj.get('Number') and obj.get('Number').count('.') >= 4)]
+    
+    print(f"\n[4] DEEP DIVE: Scanning {len(target_objects)} Units...")
+    
+    for obj in target_objects[:5]: # LIMIT TO 5
+        unit_id = obj.get('Number')
+        print(f"\n--- SCANNING {unit_id} ---")
+        
+        try:
+            # CRITICAL FIX: Pass the entire object as params, not just KeyWords
+            info_url = "https://kais.cadastre.bg/bg/Map/GetObjectInfo"
+            
+            # Construct params from the object data we received
+            params = {
+                "KeyWords": unit_id, # Fallback
+                "Id": obj.get("Id"),
+                "Type": obj.get("Type"),
+                # Add other fields the server might expect
+            }
+            
+            # The server might want ALL fields from the object dictionary
+            resp = session.get(info_url, params=obj)
+            
+            full_text = BeautifulSoup(resp.text, 'html.parser').get_text(" ", strip=True)
+            print(f"RAW: {full_text[:200]}...") 
+
+            # Regex
+            area_m = re.search(r'([\d\.]+)\s*–∫–≤\.', full_text)
+            floor_m = re.search(r'(?:–µ—Ç–∞–∂|–µ—Ç\.)\s*(\d+)', full_text)
+            
+            area = area_m.group(1) if area_m else "Unknown"
+            floor = floor_m.group(1) if floor_m else "Unknown"
+
+            print(f"-> PARSED: Floor {floor} | Area {area}")
+
+        except Exception as e:
+            print(f"    Error: {e}")
+        
+        time.sleep(0.2)
+
+if __name__ == "__main__":
+    run_debug()
+
+
+=========================================
 FILE: ./prompts/detective_prompt_v1.md
 =========================================
 # Role: Senior Real Estate Forensic Detective (Sofia, BG)
@@ -1863,37 +1941,54 @@ You are an expert in Sofia property forensics. Your goal is to cross-examine lis
 =========================================
 FILE: ./db/schema_v1.sql
 =========================================
--- Enable GIS extensions for location logic
+-- GLASHAUS REFERENCE SCHEMA (Synced with Production)
+-- Includes logic from migrations 001 (workflow), 002 (currency), and 003 (area precision)
+
 CREATE EXTENSION IF NOT EXISTS postgis;
+
+CREATE TYPE report_status AS ENUM ('PENDING', 'PROCESSING', 'VERIFIED', 'MANUAL_REVIEW', 'REJECTED');
 
 CREATE TABLE buildings (
     id SERIAL PRIMARY KEY,
-    cadastre_id VARCHAR(50) UNIQUE NOT NULL, -- The official identifier
-    address_street VARCHAR(255),
-    address_number VARCHAR(50),
-    neighborhood VARCHAR(100),
-    gps_coordinates GEOMETRY(Point, 4326),
+    cadastre_id VARCHAR(50) UNIQUE NOT NULL,
+    address_full VARCHAR(255),
+    latitude FLOAT,
+    longitude FLOAT,
     construction_year INT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE listings (
     id SERIAL PRIMARY KEY,
     source_url TEXT UNIQUE NOT NULL,
-    price_bgn DECIMAL(12, 2),
-    advertised_area_sqm DECIMAL(10, 2),
+    content_hash VARCHAR(64), -- Idempotency check
+    price_bgn NUMERIC(12, 2), -- Financial Precision
+    advertised_area_sqm NUMERIC(10, 2), -- Area Precision
     description_raw TEXT,
-    scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    scraped_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX idx_listings_content_hash ON listings(content_hash);
 
 CREATE TABLE reports (
     id SERIAL PRIMARY KEY,
-    listing_id INT REFERENCES listings(id),
+    listing_id INT REFERENCES listings(id) ON DELETE CASCADE,
     building_id INT REFERENCES buildings(id),
-    risk_score INT, -- 0 to 100 (100 is Toxic)
-    is_address_verified BOOLEAN DEFAULT FALSE,
-    discrepancy_details JSONB, -- Stores the "Apartment vs Atelier" logic
-    cost_to_generate DECIMAL(10, 4) -- Tracking the $0.22 API cost
+    status report_status DEFAULT 'PENDING',
+    risk_score INT,
+    ai_confidence_score INT DEFAULT 0,
+    legal_brief TEXT,
+    discrepancy_details JSONB,
+    image_archive_urls JSONB,
+    cost_to_generate NUMERIC(10, 4), -- API Usage Cost
+    manual_review_notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE price_history (
+    id SERIAL PRIMARY KEY,
+    listing_id INT REFERENCES listings(id),
+    price_bgn NUMERIC(12, 2),
+    changed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 
@@ -2087,6 +2182,11 @@ redis==5.0.1
 alembic==1.13.1
 Pillow==10.2.0
 structlog>=24.1.0
+
+
+=========================================
+FILE: ./-G
+=========================================
 
 
 =========================================
@@ -2301,15 +2401,18 @@ http {
 
 
 =========================================
-FILE: ./cookies.txt
+FILE: ./--data-urlencode
 =========================================
-# Netscape HTTP Cookie File
-# https://curl.se/docs/http-cookies.html
-# This file was generated by libcurl! Edit at your own risk.
 
-.imot.bg	TRUE	/	FALSE	0	imot_session_redirect	f1%091%09act%093%09
-.imot.bg	TRUE	/	FALSE	1766139545	slink_url	
-.imot.bg	TRUE	/	FALSE	1766139545	slink	
+
+=========================================
+FILE: ./-H
+=========================================
+
+
+=========================================
+FILE: ./-X
+=========================================
 
 
 =========================================
@@ -2337,230 +2440,5 @@ FILE: ./forensics/page_utf8.html
 
 
 =========================================
-FILE: ./bypass_audit.py
+FILE: ./-d
 =========================================
-import httpx
-from bs4 import BeautifulSoup
-import time
-import re
-
-def bypass_audit(url):
-    # Professional Browser Headers
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "bg-BG,bg;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://www.google.bg/",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "cross-site",
-    }
-
-    # Use a Client to maintain Cookies
-    with httpx.Client(headers=headers, follow_redirects=True, timeout=20.0) as client:
-        print("[*] STEP 1: Handshake with Home Page...")
-        home_resp = client.get("https://www.imot.bg")
-        print(f"[+] Home Page Status: {home_resp.status_code}")
-        print(f"[+] Cookies Acquired: {list(client.cookies.keys())}")
-
-        print("[*] STEP 2: Waiting (Simulating Human)...")
-        time.sleep(2.5)
-
-        print(f"[*] STEP 3: Attempting to access target: {url}")
-        # Update Referer to look like we clicked from the home page
-        client.headers.update({"Referer": "https://www.imot.bg/"})
-        
-        resp = client.get(url)
-        content = resp.content.decode('windows-1251', errors='replace')
-
-        if any(term in content.lower() for term in ["captcha", "robot", "security check"]):
-            print("!!! [FAIL] Still Blocked by WAF. They require JavaScript execution. !!!")
-            
-            # Save the failure page to see what the challenge looks like
-            with open("waf_challenge.html", "w", encoding="utf-8") as f:
-                f.write(content)
-            print("[i] Challenge page saved to waf_challenge.html. Check if it's Cloudflare or internal.")
-            return
-
-        print(f"[SUCCESS] Content Length: {len(content)} chars")
-        
-        soup = BeautifulSoup(content, 'html.parser')
-        title = soup.find('title')
-        print(f"[+] Listing Title: {title.text.strip() if title else 'N/A'}")
-
-        # Look for the price to confirm success
-        price = soup.find(id='price_obs')
-        if price:
-            print(f"[!!!] PRICE DETECTED: {price.text.strip()}")
-        else:
-            print("[?] Price tag not found. Listing might be hidden in script tags.")
-
-if __name__ == "__main__":
-    bypass_audit("https://www.imot.bg/pcgi/imot.cgi?act=5&adv=1c171899111")
-
-
-=========================================
-FILE: ./manual_session_audit.py
-=========================================
-import httpx
-from bs4 import BeautifulSoup
-
-def manual_audit(url, cookie_string):
-    # This cookie_string you will copy from your real phone browser
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        "Cookie": cookie_string,
-        "Accept-Language": "bg-BG,bg;q=0.9",
-        "Referer": "https://www.imot.bg/"
-    }
-
-    with httpx.Client(headers=headers, timeout=15.0) as client:
-        resp = client.get(url)
-        content = resp.content.decode('windows-1251', errors='replace')
-        
-        if "captcha" in content.lower():
-            print("[-] FAIL: Cookie was rejected or expired.")
-        else:
-            print("[+] SUCCESS: Bypass confirmed via Session Injection.")
-            soup = BeautifulSoup(content, 'html.parser')
-            price = soup.find(id='price_obs')
-            if price:
-                print(f"    [!!!] REVEALED PRICE: {price.text.strip()}")
-
-if __name__ == "__main__":
-    # YOU NEED TO FILL THIS FROM YOUR BROWSER
-    MY_COOKIE = "imot_session_redirect=...; sid=...;" 
-    manual_audit("https://www.imot.bg/pcgi/imot.cgi?act=5&adv=1c171899111", MY_COOKIE)
-
-
-=========================================
-FILE: ./scraper_service.py
-=========================================
-import re
-import json
-from bs4 import BeautifulSoup
-from forensics_engine import ListingForensics
-from risk_engine import RiskEngine
-
-class ScraperService:
-    def __init__(self):
-        self.forensics = ListingForensics()
-        self.risk_engine = RiskEngine()
-
-    def parse_imot_bg_html(self, html_content: str, url: str = ""):
-        """
-        Parses raw HTML from imot.bg and runs the full forensic audit.
-        """
-        soup = BeautifulSoup(html_content, 'html.parser')
-        
-        # 1. Basic Extraction
-        try:
-            title_tag = soup.find('h1')
-            title = title_tag.text.strip() if title_tag else "Unknown"
-            
-            # Price extraction (handles "139 000 ‚Ç¨")
-            price_tag = soup.find(id='price')
-            price_text = price_tag.text.strip() if price_tag else "0"
-            price_clean = re.sub(r'[^\d]', '', price_text)
-            price = float(price_clean) if price_clean else 0.0
-            
-            # Description extraction
-            desc_tag = soup.find(id='description_div')
-            description = desc_tag.text.strip() if desc_tag else ""
-            
-            # Specification extraction (Area, Floor, Type)
-            # Imot.bg usually puts these in an 'info' block or params
-            # We look for "–ü–ª–æ—â:" text
-            area = 0
-            floor = ""
-            construction = ""
-            
-            # Simple text scanning for demo purposes (imot.bg structure varies)
-            full_text = soup.get_text()
-            
-            area_match = re.search(r'–ü–ª–æ—â:\s*(\d+)', full_text)
-            if area_match:
-                area = int(area_match.group(1))
-                
-            floor_match = re.search(r'–ï—Ç–∞–∂:\s*(.*)', full_text)
-            if floor_match:
-                floor = floor_match.group(1).split('\n')[0].strip()
-                
-            type_match = re.search(r'–í–∏–¥ –∏–º–æ—Ç:\s*(.*)', full_text)
-            listing_type = "2-–°–¢–ê–ï–ù" if "2-–°–¢–ê–ï–ù" in title.upper() else "UNKNOWN"
-
-        except Exception as e:
-            return {"error": f"Parsing failed: {str(e)}"}
-
-        # 2. Forensic Analysis
-        flags = self.forensics.analyze_text(description, title)
-        
-        # Check for VAT field specifically in HTML (sometimes outside description)
-        if "–ù–µ —Å–µ –Ω–∞—á–∏—Å–ª—è–≤–∞ –î–î–°" in full_text and "VAT_EXCLUDED" not in flags:
-             # Actually "–ù–µ —Å–µ –Ω–∞—á–∏—Å–ª—è–≤–∞ –î–î–°" usually means NO VAT is owed (Private seller)
-             # But "–¶–µ–Ω–∞—Ç–∞ –µ –±–µ–∑ –î–î–°" means +20%. 
-             # Let's trust the forensics engine regex for the tricky ones.
-             pass
-
-        # 3. Normalize Price
-        real_price = self.forensics.normalize_price(price, flags)
-
-        # 4. Risk Calculation
-        listing_data = {
-            "type": listing_type,
-            "area": area,
-            "price": price,
-            "floor": floor
-        }
-        
-        risk_report = self.risk_engine.calculate_risk_score(listing_data, flags)
-
-        # 5. Construct Final Output
-        return {
-            "meta": {
-                "url": url,
-                "parsed_at": "now"
-            },
-            "basic_info": {
-                "title": title,
-                "advertised_price": price,
-                "real_price_estimate": real_price,
-                "area": area,
-                "floor": floor
-            },
-            "forensics": {
-                "detected_flags": flags,
-                "risk_audit": risk_report
-            },
-            "ai_summary": self.generate_summary(risk_report, real_price, area)
-        }
-
-    def generate_summary(self, risk_report, price, area):
-        if risk_report['verdict'] == "CRITICAL":
-            return "DO NOT BUY. This property has critical red flags."
-        if risk_report['verdict'] == "WARNING":
-            return "PROCEED WITH CAUTION. Significant discrepancies detected."
-        return "Low risk detected based on automated audit."
-
-# --- SIMULATION BLOCK (For testing) ---
-if __name__ == "__main__":
-    # Simulating the Lyulin 4 "Garsoniera" from the user dump
-    mock_html = """
-    <html>
-        <h1>–ü—Ä–æ–¥–∞–≤–∞ 2-–°–¢–ê–ï–ù, –≥—Ä–∞–¥ –°–æ—Ñ–∏—è, –õ—é–ª–∏–Ω 4</h1>
-        <div id="price">139 000 ‚Ç¨</div>
-        <div>–ü–ª–æ—â: 47 m2</div>
-        <div>–ï—Ç–∞–∂: 3-—Ç–∏ –æ—Ç 8</div>
-        <div id="description_div">
-            –ü—Ä–æ–¥–∞–≤–∞ –º–∞–ª–æ–º–µ—Ä–µ–Ω –¥–≤—É—Å—Ç–∞–µ–Ω, –ø—Ä–µ—É—Å—Ç—Ä–æ–µ–Ω–∞ –≥–∞—Ä—Å–æ–Ω–∏–µ—Ä–∞. 
-            –ñ–∏–ª–∏—â–µ—Ç–æ –µ —Å–ª–µ–¥ –ª—É–∫—Å —Ä–µ–º–æ–Ω—Ç. –ù–∞–π-–¥–æ–±—Ä–∏—è—Ç –µ—Ç–∞–∂.
-        </div>
-        <div>–ù–µ —Å–µ –Ω–∞—á–∏—Å–ª—è–≤–∞ –î–î–°</div>
-    </html>
-    """
-    
-    service = ScraperService()
-    result = service.parse_imot_bg_html(mock_html, "http://test.url")
-    print(json.dumps(result, indent=2, ensure_ascii=False))
