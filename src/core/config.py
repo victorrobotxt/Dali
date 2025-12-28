@@ -1,30 +1,29 @@
-import os
-from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Glashaus"
-    VERSION: str = "1.0.0-PROD"
-    ENV: str = Field("DEV", description="DEV or PROD")
-    
-    # API KEYS
-    GEMINI_API_KEY: str = Field(..., min_length=10, description="Google Gemini API Key")
-    GOOGLE_MAPS_API_KEY: str = Field(..., min_length=10, description="Google Maps Geocoding API Key")
+    VERSION: str = "0.1.0"
     
     # Database
-    POSTGRES_USER: str = Field(..., min_length=1)
-    POSTGRES_PASSWORD: str = Field(..., min_length=1)
-    POSTGRES_SERVER: str = Field(..., min_length=1)
-    POSTGRES_DB: str = "glashaus_db"
+    POSTGRES_USER: str = "postgres"
+    POSTGRES_PASSWORD: str = "postgres"
+    POSTGRES_DB: str = "glashaus"
+    POSTGRES_HOST: str = "localhost"
+    POSTGRES_PORT: int = 5432
+    DATABASE_URL: str = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+
+    # AI & External APIs
+    GEMINI_API_KEY: str
+    GEMINI_MODEL: str = "gemini-3.0-flash"  # <--- Updated to 3.0-flash
+    GOOGLE_MAPS_API_KEY: Optional[str] = None
     
-    REDIS_URL: str = Field(..., min_length=1)
+    # Security
+    SECRET_KEY: str = "changethis_in_production"
+    
+    # Infra
+    REDIS_URL: str = "redis://localhost:6379/0"
 
-    @property
-    def DATABASE_URL(self) -> str:
-        return f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}/{self.POSTGRES_DB}"
-
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()
