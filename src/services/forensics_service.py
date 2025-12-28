@@ -86,7 +86,8 @@ class SofiaMunicipalForensics:
             res = await client.post(f"{self.BASE_URL}/RegisterExpropriation/Read", data={'page': 1, 'pageSize': 10})
             data = res.json()
             
-            hits = data.get("Data", [])
+            # SAFEGUARD: Ensure hits is a list, even if API returns null
+            hits = data.get("Data") or []
             is_fatal = len(hits) > 0
             
             return {
@@ -123,10 +124,11 @@ class SofiaMunicipalForensics:
             res = await client.post(f"{self.BASE_URL}/RegisterCertificateForExploitationBuildings/Read", data={'page': 1, 'pageSize': 10})
             data = res.json()
             
-            hits = data.get("Data", [])
+            # SAFEGUARD: Use 'or []' to handle None
+            hits = data.get("Data") or []
             has_cert = len(hits) > 0
             
-            # Extract description if found (e.g. "Energy Efficiency" vs "New Building")
+            # Extract description if found
             cert_desc = hits[0].get("Строеж/Обект", "N/A") if has_cert else None
             
             return {

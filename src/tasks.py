@@ -9,8 +9,7 @@ from src.services.ai_engine import GeminiService
 from src.services.storage_service import StorageService
 from src.services.geospatial_service import GeospatialService
 from src.services.cadastre_service import CadastreService
-from src.services.compliance_service import ComplianceService
-from src.services.city_risk_service import CityRiskService
+from src.services.forensics_service import SofiaMunicipalForensics
 from src.services.risk_engine import RiskEngine
 from src.services.report_generator import AttorneyReportGenerator
 from src.core.config import settings
@@ -52,18 +51,14 @@ async def run_audit_pipeline(listing_id: int):
             best_address = normalize_sofia_street(geo_report.best_address or ai_data.get("address_prediction"))
             cad_data = await cadastre.get_official_details(best_address)
             
-            comp_raw = {"checked": False, "has_act16": False}
-            risk_raw = {"is_expropriated": False}
+            # NEW: UNIFIED MUNICIPAL AUDIT
+            mun_report = {"expropriation": {}, "compliance_act16": {}}
             building_id = None
             
             if cad_data.cadastre_id:
                 # Parallel Municipal Strike
-                compliance = ComplianceService(client=http_client)
-                city_risk = CityRiskService(client=http_client)
-                comp_raw, risk_raw = await asyncio.gather(
-                    compliance.check_act_16(cad_data.cadastre_id),
-                    city_risk.check_expropriation(cad_data.cadastre_id)
-                )
+                forensics = SofiaMunicipalForensics(client=http_client)
+                mun_report = await forensics.run_full_audit(cad_data.cadastre_id)
                 
                 # Persist Building Context
                 existing_building = db.query(Building).filter(Building.cadastre_id == cad_data.cadastre_id).first()
@@ -87,8 +82,9 @@ async def run_audit_pipeline(listing_id: int):
                 "ai": ai_data,
                 "geo": geo_report.model_dump(),
                 "cadastre": cad_data.model_dump(),
-                "compliance": comp_raw,
-                "city_risk": risk_raw
+                # Map new service output to Risk Engine expected keys
+                "compliance": mun_report.get("compliance_act16", {}),
+                "city_risk": mun_report.get("expropriation", {})
             }
             risk_engine = RiskEngine()
             score_res = risk_engine.calculate_score_v2(forensic_data)
