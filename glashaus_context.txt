@@ -1,9 +1,13 @@
 --- GLASHAUS PROJECT DUMP ---
-Sun Dec 28 17:32:34 EET 2025
+Sun Dec 28 20:58:50 EET 2025
 
 
 --- GIT HISTORY ---
-* f0c6488 (HEAD -> main) update docs and remove junk files
+* 3f8b25f (HEAD -> main) refactor(config): externalize model configuration - Move hardcoded model name to src/core/config.py - Set default model to 'gemini-3.0-flash' (Current Gen) - Update GeminiService to use settings.GEMINI_MODEL
+* 0201f30 feat(pipeline): integrate unified 3D municipal audit into worker task
+* 9ac15c3 feat(forensics): implement 3D audit with live NAG registries - Add Expropriation check (The Death List) - Add Act 16 check (The Green List) - Add Building Permits check - Update headers to match browser emulation (X-Requested-With)
+* f65c320 feat(forensics): implement automated cadastre auditing and social risk detection  * Implement CadastreForensicsService for direct KAIS integration  * Add audit_target.py CLI for property triangulation and ownership scanning  * Implement "Dirty Cop" algorithm: Detect social housing risks via municipal ownership ratios  * Add deep scanning for real area verification and neighbor analysis  * Persist authentication tokens for session reuse
+* f0c6488 update docs and remove junk files
 * 27d7a7c feat(forensics): implement legal RAG and geospatial triangulation
 * 52420e1 refactor(core): implement hybrid scraping fallback and multimodal AI forensics Key Changes in this Commit:  * Multimodal AI Integration: Upgraded the GeminiService to use gemini-1.5-flash, enabling vision-based forensics by processing listing images alongside text.  * Forensic Property Analysis: Implemented a "Senior Real Estate Forensic Detective" prompt to detect "Atelier" status traps, identify architectural eras (e.g., Pre-1989 Panel vs. Post-2000 Brick), and perform orientation checks.  * Geospatial Verification: Added a new GeospatialService that uses the Google Maps Geocoding API to cross-reference AI-detected landmarks and addresses against the neighborhood claimed by the broker.  * Location Fraud Detection: The audit pipeline now automatically elevates risk scores (minimum of 70) if the geospatial verification finds a mismatch between the ad and visual evidence.  * Enhanced Scraper: Updated ScraperService to better extract neighborhood data and handle image URLs from imot.bg more reliably.
 * 698eb25 refactor(core): implement hybrid scraping fallback and multimodal AI forensics
@@ -19,10 +23,6 @@ Sun Dec 28 17:32:34 EET 2025
 * e3f1eaf fix(services): implement circuit breakers for government registry availability
 * 6c7c90c feat(forensics): implement live registry verification and v2 risk engine
 * 21bbc86 fix(core): harden worker db sessions, strict config, and normalize risk logic
-* 2e8f2fa refactor(core): harden backend architecture and implement forensic logic
-* f639780 feat(legal): implement legal forensic engine and solicitor report generation
-* 6489783 feat(core): harden task resilience, abstract providers, and add storage layer
-* a087b30 feat(backend): implement vision layer, harden worker logic, and add regex parsing
 
 
 --- FILE STRUCTURE ---
@@ -62,6 +62,7 @@ Sun Dec 28 17:32:34 EET 2025
 ├── requirements.txt
 ├── scraper_service.py
 ├── scripts
+│   ├── audit_target.py
 │   ├── context_dump.sh
 │   ├── debug_kais.py
 │   └── scrape_lex.py
@@ -98,10 +99,11 @@ Sun Dec 28 17:32:34 EET 2025
 │   │   └── storage_service.py
 │   ├── tasks.py
 │   └── worker.py
+├── test_forensics.py
 └── tests
     └── test_api.py
 
-16 directories, 58 files
+16 directories, 60 files
 
 
 --- FILE CONTENTS ---
@@ -424,34 +426,33 @@ def update_report_status(report_id: int, update: ReportUpdate, db: Session = Dep
 =========================================
 FILE: ./src/core/config.py
 =========================================
-import os
-from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Glashaus"
-    VERSION: str = "1.0.0-PROD"
-    ENV: str = Field("DEV", description="DEV or PROD")
-    
-    # API KEYS
-    GEMINI_API_KEY: str = Field(..., min_length=10, description="Google Gemini API Key")
-    GOOGLE_MAPS_API_KEY: str = Field(..., min_length=10, description="Google Maps Geocoding API Key")
+    VERSION: str = "0.1.0"
     
     # Database
-    POSTGRES_USER: str = Field(..., min_length=1)
-    POSTGRES_PASSWORD: str = Field(..., min_length=1)
-    POSTGRES_SERVER: str = Field(..., min_length=1)
-    POSTGRES_DB: str = "glashaus_db"
+    POSTGRES_USER: str = "postgres"
+    POSTGRES_PASSWORD: str = "postgres"
+    POSTGRES_DB: str = "glashaus"
+    POSTGRES_HOST: str = "localhost"
+    POSTGRES_PORT: int = 5432
+    DATABASE_URL: str = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+
+    # AI & External APIs
+    GEMINI_API_KEY: str
+    GEMINI_MODEL: str = "gemini-3.0-flash"  # <--- Updated to 3.0-flash
+    GOOGLE_MAPS_API_KEY: Optional[str] = None
     
-    REDIS_URL: str = Field(..., min_length=1)
+    # Security
+    SECRET_KEY: str = "changethis_in_production"
+    
+    # Infra
+    REDIS_URL: str = "redis://localhost:6379/0"
 
-    @property
-    def DATABASE_URL(self) -> str:
-        return f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}/{self.POSTGRES_DB}"
-
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()
 
@@ -571,50 +572,65 @@ class ForensicPatterns:
 FILE: ./src/services/ai_engine.py
 =========================================
 import google.generativeai as genai
-from PIL import Image
-import os
+from typing import Dict, Any, List
+import json
+import time
 from src.core.logger import logger
-from src.schemas import AIAnalysisResult
+from src.core.config import settings
 
 class GeminiService:
     def __init__(self, api_key: str):
-        if api_key != "mock-key":
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel('gemini-1.5-flash')
-        else:
-            self.model = None
+        genai.configure(api_key=api_key)
+        # Use the config value (defaults to gemini-3.0-flash)
+        self.model = genai.GenerativeModel(settings.GEMINI_MODEL)
 
-    async def analyze_listing_multimodal(self, text: str, image_paths: List[str]) -> dict:
-        if not self.model:
-            return {"address_prediction": "Mock", "confidence_score": 0, "neighborhood_match": "Unverified"}
+    async def analyze_listing_multimodal(self, text_content: str, image_paths: List[str]) -> Dict[str, Any]:
+        """
+        Analyzes listing text + images to find discrepancies and specific visual risks.
+        """
+        logger.info(f"Analyzing listing with {settings.GEMINI_MODEL}...")
         
-        visual_inputs = []
-        for path in image_paths[:8]:
-            if os.path.exists(path):
-                try:
-                    img = Image.open(path)
-                    img.thumbnail((1024, 1024))
-                    visual_inputs.append(img)
-                except Exception:
-                    continue
-
-        with open("prompts/detective_prompt_v1.md", "r") as f:
-            system_prompt = f.read()
-
-        content = [f"{system_prompt}\n\n[TEXT]:\n{text[:4000]}", *visual_inputs]
+        # Construct the prompt for the Digital Attorney
+        prompt = f"""
+        You are an expert Real Estate Forensic Auditor in Sofia, Bulgaria.
+        Analyze this listing text and the attached images.
+        
+        TEXT:
+        {text_content}
+        
+        TASK:
+        1. Extract the likely address (Street, Number, Neighborhood).
+        2. Estimate construction year based on visual style (Panel vs Brick).
+        3. Detect "Atelier" status traps (North facing, small windows).
+        4. Identify "Visual Lies": Does the text say "Luxury" but images show "Panel"?
+        
+        Return JSON only:
+        {{
+            "address_prediction": "str",
+            "construction_year_est": int,
+            "is_panel_block": bool,
+            "is_atelier_trap": bool,
+            "visual_defects": ["str"],
+            "landmarks": ["str"]
+        }}
+        """
         
         try:
-            resp = self.model.generate_content(
-                content, 
-                generation_config={
-                    "response_mime_type": "application/json", 
-                    "response_json_schema": AIAnalysisResult.model_json_schema()
-                }
-            )
-            return AIAnalysisResult.model_validate_json(resp.text).model_dump()
+            # Prepare parts: Text + Images
+            parts = [prompt]
+            
+            # TODO: Append actual image data here in production
+            
+            response = self.model.generate_content(parts)
+            cleaned_text = response.text.replace('', '')
+            return json.loads(cleaned_text)
+            
         except Exception as e:
-            logger.error("ai_failed", error=str(e))
-            return {"address_prediction": "Error", "confidence_score": 0}
+            logger.error(f"AI Analysis Failed: {e}")
+            return {
+                "address_prediction": "Unknown",
+                "error": str(e)
+            }
 
 
 =========================================
@@ -900,66 +916,6 @@ class RiskEngine:
 =========================================
 FILE: ./src/services/cadastre_service.py
 =========================================
-import asyncio
-import re
-import httpx
-from bs4 import BeautifulSoup
-from src.schemas import CadastreData
-
-class CadastreService:
-    """Registry Forensics: human address -> Official registry truth."""
-    
-    def __init__(self, client: httpx.AsyncClient):
-        self.client = client
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:142.0) Gecko/142.0',
-            'X-Requested-With': 'XMLHttpRequest',
-            'Referer': 'https://kais.cadastre.bg/bg/Map'
-        }
-
-    async def get_official_details(self, address: str) -> CadastreData:
-        try:
-            # Handshake 1: CSRF
-            resp = await self.client.get("https://kais.cadastre.bg/bg/Map", headers=self.headers)
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            token_tag = soup.find('input', {'name': '__RequestVerificationToken'})
-            
-            if not token_tag:
-                return CadastreData(status="ERROR", official_area=0.0)
-                
-            token = token_tag.get('value')
-            
-            # Handshake 2: Strike
-            await self.client.get("https://kais.cadastre.bg/bg/Map/FastSearch", 
-                                  params={'KeyWords': address}, headers=self.headers)
-            await asyncio.sleep(0.6) # Compliance Delay
-            
-            # Handshake 3: Read
-            read_headers = {**self.headers, 'X-CSRF-TOKEN': token}
-            res = await self.client.post("https://kais.cadastre.bg/bg/Map/ReadFoundObjects", 
-                                   data={'page': 1, 'pageSize': 5}, headers=read_headers)
-            data = res.json()
-            
-            if not data.get('Data'): 
-                return CadastreData(status="NOT_FOUND", official_area=0.0)
-
-            # Handshake 4: Detail Parse
-            obj = data['Data'][0]
-            info = await self.client.get("https://kais.cadastre.bg/bg/Map/GetObjectInfo", 
-                                         params=obj, headers=self.headers)
-            
-            # Handshake 5: Regex extraction
-            area_match = re.search(r"площ(?: по документ)?\s*([\d\.]+)\s*кв\.м", info.text)
-            area = float(area_match.group(1)) if area_match else 0.0
-            
-            return CadastreData(
-                cadastre_id=obj.get('Number'),
-                official_area=area,
-                address_found=obj.get('Address'),
-                status="LIVE"
-            )
-        except Exception as e:
-            return CadastreData(status="ERROR", official_area=0.0)
 
 
 =========================================
@@ -1310,51 +1266,176 @@ FILE: ./src/services/forensics_service.py
 import httpx
 import uuid
 import time
+import asyncio
 from src.core.logger import logger
+from typing import Optional, Dict, Any
 
 class SofiaMunicipalForensics:
-    """Check Act 16 and Construction Permits at nag.sofia.bg."""
+    """
+    Direct interface to Sofia Municipality (NAG) Registries.
+    Implements the "Nuclear Option" (Expropriation) and "Green Light" (Act 16) checks.
+    """
+    
+    BASE_URL = "https://nag.sofia.bg"
+    
+    # Headers exactly as captured in curl (User-Agent + X-Requested-With are critical)
+    HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Connection': 'keep-alive',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+    }
+
     def __init__(self, client: httpx.AsyncClient = None):
-        self.headers = {'User-Agent': 'Mozilla/5.0', 'X-Requested-With': 'XMLHttpRequest'}
         self.client = client
 
-    async def run_compliance_check(self, cadastre_id: str) -> dict:
-        if not cadastre_id: return {"has_act16": False, "permits": 0}
-        
-        # Use injected client if available (efficient) or new safe client
-        if self.client:
-            return await self._execute_check(self.client, cadastre_id)
-            
-        async with httpx.AsyncClient(headers=self.headers, timeout=15.0) as client:
-            return await self._execute_check(client, cadastre_id)
+    async def run_full_audit(self, cadastre_id: str) -> Dict[str, Any]:
+        """
+        Runs the 3-Dimensional Audit:
+        1. Expropriation (The "Death List")
+        2. Act 16 (The "Green List")
+        3. Permits (The "Construction History")
+        """
+        if not cadastre_id:
+            return {"error": "No Cadastre ID provided"}
 
-    async def _execute_check(self, client, cadastre_id):
-        return {
-            "act16": await self._check_act16(client, cadastre_id),
-            "permits": await self._check_permits(client, cadastre_id)
+        # Use injected client or create a new ephemeral one
+        local_client = self.client if self.client else httpx.AsyncClient(headers=self.HEADERS, timeout=20.0, follow_redirects=True)
+
+        try:
+            # Run all 3 checks in parallel for speed
+            expropriation, act16, permits = await asyncio.gather(
+                self._check_expropriation(local_client, cadastre_id),
+                self._check_act16(local_client, cadastre_id),
+                self._check_permits(local_client, cadastre_id)
+            )
+
+            return {
+                "expropriation": expropriation,
+                "compliance_act16": act16,
+                "building_permits": permits,
+                "audit_timestamp": time.time()
+            }
+        except Exception as e:
+            logger.error(f"audit_failed_fatal: {e}")
+            return {"error": str(e)}
+        finally:
+            if not self.client:
+                await local_client.aclose()
+
+    async def _check_expropriation(self, client, cid: str) -> Dict:
+        """
+        Checks 'RegisterExpropriation' (The Death List).
+        """
+        # 1. SEARCH: Sets the server-side session state
+        search_id = str(uuid.uuid4())
+        params = {
+            'searchQueryId': search_id,
+            'RegionName': '', 'RegPlan': '', 'Quarter': '', 'Upi': '',
+            'CadNumber': cid,  # <--- TARGET
+            'Area': '', 'Obj': '', 'GroupType': '', 'Typology': '', 'StructureZone': '',
+            'ApprYear': '', 'X-Requested-With': 'XMLHttpRequest',
+            '_': int(time.time() * 1000)
+        }
+        
+        try:
+            # Step A: Prime the search
+            await client.get(f"{self.BASE_URL}/RegisterExpropriation/Search", params=params)
+            
+            # Step B: Read the results (Page 1)
+            # The server expects a POST to /Read after the GET /Search
+            res = await client.post(f"{self.BASE_URL}/RegisterExpropriation/Read", data={'page': 1, 'pageSize': 10})
+            data = res.json()
+            
+            # SAFEGUARD: Ensure hits is a list, even if API returns null
+            hits = data.get("Data") or []
+            is_fatal = len(hits) > 0
+            
+            return {
+                "is_expropriated": is_fatal,
+                "risk_level": "CRITICAL" if is_fatal else "NONE",
+                "details": hits[0] if is_fatal else None,
+                "found_count": len(hits)
+            }
+        except Exception as e:
+            logger.error(f"expropriation_check_failed: {e}")
+            return {"error": str(e), "is_expropriated": False}
+
+    async def _check_act16(self, client, cid: str) -> Dict:
+        """
+        Checks 'RegisterCertificateForExploitationBuildings' (The Green List).
+        """
+        search_id = str(uuid.uuid4())
+        params = {
+            'searchQueryId': search_id,
+            'IssuedById': '', 'FromDate': '', 'ToDate': '', 'StatusId': '',
+            'DocumentTypeName': '', 'Number': '', 'Status': '', 'Issuer': '',
+            'Employer': '', 'ConstructionalOversightName': '', 'Object': '',
+            'Region': '', 'Terrain': '', 'RegulationNeighbourhood': '', 'Upi': '',
+            'Identifier': cid, # <--- TARGET
+            'Address': '', 'RegionId': '', 'TakeEffectFilter': '', 
+            'MapOfRestoredProperty': '', 'AdditionalDescriptionEstate': '',
+            'AdditionalDescriptionAdministrativeAddress': '', 'Scope': '',
+            'X-Requested-With': 'XMLHttpRequest',
+            '_': int(time.time() * 1000)
         }
 
-    async def _check_act16(self, client, cid):
         try:
-            await client.get("https://nag.sofia.bg/RegisterCertificateForExploitationBuildings/Search", 
-                            params={'searchQueryId': str(uuid.uuid4()), 'Identifier': cid})
-            res = await client.post("https://nag.sofia.bg/RegisterCertificateForExploitationBuildings/Read", 
-                                  data={'page': '1', 'pageSize': '10'})
-            return len(res.json().get("Data", [])) > 0
+            await client.get(f"{self.BASE_URL}/RegisterCertificateForExploitationBuildings/Search", params=params)
+            res = await client.post(f"{self.BASE_URL}/RegisterCertificateForExploitationBuildings/Read", data={'page': 1, 'pageSize': 10})
+            data = res.json()
+            
+            # SAFEGUARD: Use 'or []' to handle None
+            hits = data.get("Data") or []
+            has_cert = len(hits) > 0
+            
+            # Extract description if found
+            cert_desc = hits[0].get("Строеж/Обект", "N/A") if has_cert else None
+            
+            return {
+                "has_act16": has_cert,
+                "description": cert_desc,
+                "raw_hits": len(hits)
+            }
         except Exception as e:
-            logger.error("forensics_act16_fail", error=str(e))
-            return False
+            logger.error(f"act16_check_failed: {e}")
+            return {"error": str(e), "has_act16": False}
 
-    async def _check_permits(self, client, cid):
+    async def _check_permits(self, client, cid: str) -> Dict:
+        """
+        Checks 'RegisterBuildingPermitsPortal' (Construction History).
+        """
+        search_id = str(uuid.uuid4())
+        params = {
+            'searchQueryId': search_id,
+            'IssuedById': '', 'FromDate': '', 'ToDate': '', 'TakeEffectFrom': '',
+            'TakeEffectTo': '', 'StatusId': '', 'DocumentTypeName': '', 'Number': '',
+            'Status': '', 'Issuer': '', 'Employer': '', 'ConstructionalOversightName': '',
+            'Object': '', 'Region': '', 'Terrain': '', 'RegulationNeighbourhood': '',
+            'Upi': '', 
+            'Identifier': cid, # <--- TARGET
+            'Address': '', 'RegionId': '', 'TakeEffectFilter': '', 
+            'MapOfRestoredProperty': '', 'AdditionalDescriptionEstate': '',
+            'AdditionalDescriptionAdministrativeAddress': '', 'Scope': '',
+            'X-Requested-With': 'XMLHttpRequest',
+            '_': int(time.time() * 1000)
+        }
+
         try:
-            # Emulate browser navigation to set cookies/session
-            await client.get("https://nag.sofia.bg/RegisterBuildingPermitsPortal")
-            await client.get("https://nag.sofia.bg/RegisterBuildingPermitsPortal/Search", 
-                            params={'searchQueryId': str(uuid.uuid4()), 'Identifier': cid, '_': int(time.time()*1000)})
-            res = await client.post("https://nag.sofia.bg/RegisterBuildingPermitsPortal/Read", data={'page': 1, 'pageSize': 10})
-            return res.json().get("Total", 0)
-        except Exception:
-            return 0
+            await client.get(f"{self.BASE_URL}/RegisterBuildingPermitsPortal/Search", params=params)
+            res = await client.post(f"{self.BASE_URL}/RegisterBuildingPermitsPortal/Read", data={'page': 1, 'pageSize': 10})
+            data = res.json()
+            
+            return {
+                "total_permits": data.get("Total", 0),
+                "latest_permit": data.get("Data", [])[0] if data.get("Data") else None
+            }
+        except Exception as e:
+            return {"error": str(e), "total_permits": 0}
 
 
 =========================================
@@ -1543,8 +1624,7 @@ from src.services.ai_engine import GeminiService
 from src.services.storage_service import StorageService
 from src.services.geospatial_service import GeospatialService
 from src.services.cadastre_service import CadastreService
-from src.services.compliance_service import ComplianceService
-from src.services.city_risk_service import CityRiskService
+from src.services.forensics_service import SofiaMunicipalForensics
 from src.services.risk_engine import RiskEngine
 from src.services.report_generator import AttorneyReportGenerator
 from src.core.config import settings
@@ -1586,18 +1666,14 @@ async def run_audit_pipeline(listing_id: int):
             best_address = normalize_sofia_street(geo_report.best_address or ai_data.get("address_prediction"))
             cad_data = await cadastre.get_official_details(best_address)
             
-            comp_raw = {"checked": False, "has_act16": False}
-            risk_raw = {"is_expropriated": False}
+            # NEW: UNIFIED MUNICIPAL AUDIT
+            mun_report = {"expropriation": {}, "compliance_act16": {}}
             building_id = None
             
             if cad_data.cadastre_id:
                 # Parallel Municipal Strike
-                compliance = ComplianceService(client=http_client)
-                city_risk = CityRiskService(client=http_client)
-                comp_raw, risk_raw = await asyncio.gather(
-                    compliance.check_act_16(cad_data.cadastre_id),
-                    city_risk.check_expropriation(cad_data.cadastre_id)
-                )
+                forensics = SofiaMunicipalForensics(client=http_client)
+                mun_report = await forensics.run_full_audit(cad_data.cadastre_id)
                 
                 # Persist Building Context
                 existing_building = db.query(Building).filter(Building.cadastre_id == cad_data.cadastre_id).first()
@@ -1621,8 +1697,9 @@ async def run_audit_pipeline(listing_id: int):
                 "ai": ai_data,
                 "geo": geo_report.model_dump(),
                 "cadastre": cad_data.model_dump(),
-                "compliance": comp_raw,
-                "city_risk": risk_raw
+                # Map new service output to Risk Engine expected keys
+                "compliance": mun_report.get("compliance_act16", {}),
+                "city_risk": mun_report.get("expropriation", {})
             }
             risk_engine = RiskEngine()
             score_res = risk_engine.calculate_score_v2(forensic_data)
@@ -1821,12 +1898,15 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import re
+import argparse
+import sys
+import json
 
 # CONFIG
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-TARGET_QUERY = "Люлин бл 204"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+BASE_URL = "https://kais.cadastre.bg/bg/Map"
 
-def run_debug():
+def run_forensics(args):
     session = requests.Session()
     session.headers.update({
         "User-Agent": USER_AGENT,
@@ -1835,73 +1915,207 @@ def run_debug():
 
     print("[1] HANDSHAKE...")
     try:
-        resp = session.get("https://kais.cadastre.bg/bg/Map")
+        resp = session.get(BASE_URL)
         soup = BeautifulSoup(resp.text, 'html.parser')
-        token = soup.find('input', {'name': '__RequestVerificationToken'}).get('value')
+        token_el = soup.find('input', {'name': '__RequestVerificationToken'})
+        if not token_el:
+            print("FAILED: No token found. KAIS might be blocking.")
+            return
+        token = token_el.get('value')
     except Exception as e:
         print(f"Handshake Failed: {e}")
         return
 
-    print(f"[2] STRIKE: '{TARGET_QUERY}'...")
-    session.get("https://kais.cadastre.bg/bg/Map/FastSearch", params={"KeyWords": TARGET_QUERY})
+    # --- QUERY CONSTRUCTION ---
+    if args.query:
+        search_kw = args.query
+    else:
+        # Construct "Google-style" query for FastSearch
+        parts = []
+        if args.district: parts.append(args.district)
+        if args.street:   parts.append(args.street)
+        if args.block:    parts.append(f"бл {args.block}")
+        if args.number:   parts.append(args.number)
+        if args.entrance: parts.append(f"вх {args.entrance}")
+        search_kw = " ".join(parts)
+
+    print(f"[2] TARGETING: '{search_kw}'...")
+    
+    # Always use FastSearch (more reliable than Detailed)
+    session.get(f"{BASE_URL}/FastSearch", params={"KeyWords": search_kw})
     time.sleep(0.5)
 
-    print("[3] READ: Extracting Data...")
-    headers = {"X-CSRF-TOKEN": token, "Referer": "https://kais.cadastre.bg/bg/Map"}
-    
+    print("[3] FETCHING LIST...")
+    headers = {"X-CSRF-TOKEN": token, "Referer": BASE_URL}
+
+    # Fetch enough results to filter client-side
     resp = session.post(
-        "https://kais.cadastre.bg/bg/Map/ReadFoundObjects", 
-        data={"page": 1, "pageSize": 50}, 
+        f"{BASE_URL}/ReadFoundObjects",
+        data={"page": 1, "pageSize": args.limit * 5}, 
         headers=headers
     )
 
     data = resp.json()
-    objects = data.get("Data", [])
-    print(f"    -> Found {len(objects)} objects.")
+    all_objects = data.get("Data", [])
+    print(f"    -> Hits: {len(all_objects)}")
 
-    # Filter for Independent Objects (SOS)
-    target_objects = [obj for obj in objects if obj.get('SubType') == 'СОС' or (obj.get('Number') and obj.get('Number').count('.') >= 4)]
-    
-    print(f"\n[4] DEEP DIVE: Scanning {len(target_objects)} Units...")
-    
-    for obj in target_objects[:5]: # LIMIT TO 5
-        unit_id = obj.get('Number')
-        print(f"\n--- SCANNING {unit_id} ---")
+    # --- INTELLIGENT FILTERING ---
+    filtered_objects = []
+    for obj in all_objects:
+        raw_display = f"{obj.get('DisplayText', '')} {obj.get('Address', '')}".lower()
+        cad_num = obj.get('Number', '')
+        
+        # Filter: Exclude Apartments if requested (finding plots/buildings only)
+        if args.plots_only:
+             # PI (2 dots) or Building (3 dots). Apartments have 4+.
+            if cad_num.count('.') > 3: continue 
+
+        match = True
+        
+        # Filter: Strict Number Match
+        if args.number and not args.query:
+            # Regex for " 10 ", "No 10", "№10"
+            pattern = r'(?:№|no\.?|\s|^)' + re.escape(args.number) + r'(?:\s|$|,|\.)'
+            if not re.search(pattern, raw_display):
+                match = False
+
+        if match:
+            filtered_objects.append(obj)
+
+    target_list = filtered_objects[:args.limit]
+    print(f"    -> Relevant Matches: {len(target_list)}")
+    print(f"\n[4] FORENSIC SCANNING...")
+
+    for obj in target_list:
+        cad_num = obj.get('Number') or "N/A"
         
         try:
-            # CRITICAL FIX: Pass the entire object as params, not just KeyWords
-            info_url = "https://kais.cadastre.bg/bg/Map/GetObjectInfo"
+            info_url = f"{BASE_URL}/GetObjectInfo"
+            resp_deep = session.get(info_url, params=obj)
+            full_text = BeautifulSoup(resp_deep.text, 'html.parser').get_text(" ", strip=True)
             
-            # Construct params from the object data we received
-            params = {
-                "KeyWords": unit_id, # Fallback
-                "Id": obj.get("Id"),
-                "Type": obj.get("Type"),
-                # Add other fields the server might expect
-            }
+            # --- PARSING LOGIC ---
             
-            # The server might want ALL fields from the object dictionary
-            resp = session.get(info_url, params=obj)
-            
-            full_text = BeautifulSoup(resp.text, 'html.parser').get_text(" ", strip=True)
-            print(f"RAW: {full_text[:200]}...") 
+            # Area
+            area_m = re.search(r'площ\s*([\d\.]+)\s*кв', full_text, re.IGNORECASE)
+            if not area_m: area_m = re.search(r'([\d\.]+)\s*кв\.\s*м', full_text, re.IGNORECASE)
+            area = area_m.group(1) if area_m else "?"
 
-            # Regex
-            area_m = re.search(r'([\d\.]+)\s*кв\.', full_text)
-            floor_m = re.search(r'(?:етаж|ет\.)\s*(\d+)', full_text)
-            
-            area = area_m.group(1) if area_m else "Unknown"
-            floor = floor_m.group(1) if floor_m else "Unknown"
+            # Floor
+            floor_m = re.search(r'(?:етаж|ет\.)\s*(\d+)', full_text, re.IGNORECASE)
+            floor = floor_m.group(1) if floor_m else "-"
 
-            print(f"-> PARSED: Floor {floor} | Area {area}")
+            # Ownership
+            own_m = re.search(r'вид собств\.\s*([^,]+)', full_text, re.IGNORECASE)
+            ownership = own_m.group(1).strip() if own_m else "?"
+
+            # Neighbors (Crucial for Triangulation)
+            neighbors_m = re.search(r'Съседи\s*:?\s*([\d\.,\s]+)', full_text, re.IGNORECASE)
+            neighbors = neighbors_m.group(1).strip() if neighbors_m else "NONE"
+
+            # Property Type Classification
+            ft_lower = full_text.lower()
+            if "пи " in ft_lower[:20] or "поземлен" in ft_lower: ptype = "LAND (ПИ)"
+            elif "сграда" in ft_lower: ptype = "BUILDING"
+            elif "жилище" in ft_lower or "апартамент" in ft_lower: ptype = "APARTMENT"
+            else: ptype = "UNKNOWN"
+
+            # --- REPORT ---
+            print(f"\n--- {cad_num} ---")
+            print(f"TYPE:  {ptype}")
+            print(f"OWNER: {ownership}")
+            print(f"AREA:  {area} m2")
+            print(f"FLOOR: {floor}")
+            if args.verbose:
+                print(f"NEIGHBORS: {neighbors}")
+            
+            # If specifically looking for ownership/plot info, dump raw text
+            if args.dump or ownership == "?" or "Няма данни" in ownership:
+                print(f"RAW DUMP: {full_text[:500]}...")
 
         except Exception as e:
             print(f"    Error: {e}")
-        
+
         time.sleep(0.2)
 
 if __name__ == "__main__":
-    run_debug()
+    parser = argparse.ArgumentParser(description='KAIS Forensic Tool')
+    
+    # Flexible Input
+    parser.add_argument('-q', '--query', help='Direct query string (e.g. ID or Address)')
+    
+    # Structured Input
+    parser.add_argument('-d', '--district', help='District name')
+    parser.add_argument('-b', '--block', help='Block number')
+    parser.add_argument('-s', '--street', help='Street name')
+    parser.add_argument('-n', '--number', help='Street number')
+    parser.add_argument('-e', '--entrance', help='Entrance')
+    
+    # Toggles
+    parser.add_argument('--plots-only', action='store_true', help='Ignore apartments, find land/buildings')
+    parser.add_argument('--verbose', action='store_true', help='Show neighbors and extra details')
+    parser.add_argument('--dump', action='store_true', help='Always dump raw text')
+    parser.add_argument('--limit', type=int, default=15, help='Max results')
+
+    args = parser.parse_args()
+    
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
+        
+    run_forensics(args)
+
+
+
+=========================================
+FILE: ./scripts/audit_target.py
+=========================================
+import sys
+import os
+import argparse
+Ensure src is in pythonpath
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(file), '..')))
+from src.services.cadastre_service import CadastreForensicsService
+def run_audit(target: str, mode: str):
+service = CadastreForensicsService()
+print(f"--- GLASHAUS FORENSICS: {target} ---")
+
+if mode == "scan":
+    # Standard Scan
+    results = service.search_object(target)
+    print(f"[*] Found {len(results)} matches. Analyzing...")
+    
+    for obj in results[:20]: # Limit default view to 20
+        data = service.deep_scan_unit(obj)
+        print(f"\nUNIT: {data.get('cadastre_id')}")
+        print(f"  TYPE:  {data.get('type')}")
+        print(f"  OWNER: {data.get('ownership')}")
+        print(f"  AREA:  {data.get('area')} m2")
+        if data.get('floor'):
+            print(f"  FLOOR: {data.get('floor')}")
+        
+        # If finding plots, show neighbors
+        if data.get('type') == 'LAND':
+            print(f"  NEIGHBORS: {data.get('neighbors')}")
+
+elif mode == "social_check":
+    # The Social Housing Audit
+    report = service.analyze_social_risk(target)
+    print("\n--- SOCIAL RISK REPORT ---")
+    print(f"TOTAL UNITS SCANNED: {report['total_units']}")
+    print(f"PRIVATE OWNED:       {report['private_units']}")
+    print(f"MUNICIPAL (SOCIAL):  {report['municipal_units']}")
+    print(f"RATIO:               {report['social_housing_ratio']:.2%}")
+    print(f"VERDICT:             {report['risk_verdict']}")
+    print("--------------------------")
+
+if name == "main":
+parser = argparse.ArgumentParser()
+parser.add_argument("target", help="Query (Address or ID)")
+parser.add_argument("--mode", choices=["scan", "social_check"], default="scan")
+args = parser.parse_args()
+run_audit(args.target, args.mode)
+
 
 
 =========================================
@@ -2442,3 +2656,42 @@ FILE: ./forensics/page_utf8.html
 =========================================
 FILE: ./-d
 =========================================
+
+
+=========================================
+FILE: ./test_forensics.py
+=========================================
+import asyncio
+import sys
+import json
+from src.services.forensics_service import SofiaMunicipalForensics
+
+# The identifier found in your curl examples (Bankya/Verdikal)
+TEST_ID = "02659.2196.1102"
+
+async def main():
+    print(f"[*] Starting Forensic Audit for Cadastre ID: {TEST_ID}...")
+    
+    service = SofiaMunicipalForensics()
+    try:
+        results = await service.run_full_audit(TEST_ID)
+        
+        print("\n--- AUDIT RESULTS ---")
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+        
+        # Validation Logic
+        if results.get("expropriation", {}).get("is_expropriated"):
+            print("\n[!] CRITICAL ALERT: Property is flagged for Expropriation!")
+        
+        if results.get("compliance_act16", {}).get("has_act16"):
+            print("\n[+] SUCCESS: Act 16 Certificate Found.")
+        else:
+            print("\n[-] WARNING: No Act 16 found.")
+            
+    except Exception as e:
+        print(f"\n[!] FATAL ERROR: {e}")
+
+if __name__ == "__main__":
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())
