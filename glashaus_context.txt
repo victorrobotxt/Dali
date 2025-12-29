@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Sun Dec 28 20:58:50 EET 2025
+Mon Dec 29 09:51:32 EET 2025
 
 
 --- GIT HISTORY ---
-* 3f8b25f (HEAD -> main) refactor(config): externalize model configuration - Move hardcoded model name to src/core/config.py - Set default model to 'gemini-3.0-flash' (Current Gen) - Update GeminiService to use settings.GEMINI_MODEL
+* 8a82ecf (HEAD -> main) chore(maint): cleanup workspace and update project context
+* 3f8b25f refactor(config): externalize model configuration - Move hardcoded model name to src/core/config.py - Set default model to 'gemini-3.0-flash' (Current Gen) - Update GeminiService to use settings.GEMINI_MODEL
 * 0201f30 feat(pipeline): integrate unified 3D municipal audit into worker task
 * 9ac15c3 feat(forensics): implement 3D audit with live NAG registries - Add Expropriation check (The Death List) - Add Act 16 check (The Green List) - Add Building Permits check - Update headers to match browser emulation (X-Requested-With)
 * f65c320 feat(forensics): implement automated cadastre auditing and social risk detection  * Implement CadastreForensicsService for direct KAIS integration  * Add audit_target.py CLI for property triangulation and ownership scanning  * Implement "Dirty Cop" algorithm: Detect social housing risks via municipal ownership ratios  * Add deep scanning for real area verification and neighbor analysis  * Persist authentication tokens for session reuse
@@ -22,16 +23,10 @@ Sun Dec 28 20:58:50 EET 2025
 * 00b1e10 feat(reporting): integrate forensic registry checks into Legal Brief generation
 * e3f1eaf fix(services): implement circuit breakers for government registry availability
 * 6c7c90c feat(forensics): implement live registry verification and v2 risk engine
-* 21bbc86 fix(core): harden worker db sessions, strict config, and normalize risk logic
 
 
 --- FILE STRUCTURE ---
 .
-├── --data-urlencode
-├── -G
-├── -H
-├── -X
-├── -d
 ├── Dockerfile
 ├── README.md
 ├── alembic.ini
@@ -103,7 +98,7 @@ Sun Dec 28 20:58:50 EET 2025
 └── tests
     └── test_api.py
 
-16 directories, 60 files
+16 directories, 55 files
 
 
 --- FILE CONTENTS ---
@@ -2399,11 +2394,6 @@ structlog>=24.1.0
 
 
 =========================================
-FILE: ./-G
-=========================================
-
-
-=========================================
 FILE: ./Dockerfile
 =========================================
 # STAGE 1: Builder
@@ -2615,21 +2605,6 @@ http {
 
 
 =========================================
-FILE: ./--data-urlencode
-=========================================
-
-
-=========================================
-FILE: ./-H
-=========================================
-
-
-=========================================
-FILE: ./-X
-=========================================
-
-
-=========================================
 FILE: ./forensics/headers.txt
 =========================================
 HTTP/2 200 
@@ -2650,11 +2625,6 @@ alt-svc: h3=":443"; ma=86400
 
 =========================================
 FILE: ./forensics/page_utf8.html
-=========================================
-
-
-=========================================
-FILE: ./-d
 =========================================
 
 
