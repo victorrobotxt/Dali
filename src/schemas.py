@@ -9,6 +9,11 @@ class ScrapedListing(BaseModel):
     area_sqm: Decimal
     neighborhood: str 
     image_urls: List[str] = []
+    
+    # New Forensic Fields
+    is_vat_excluded: bool = False
+    is_direct_owner: bool = False
+    price_correction_note: Optional[str] = None
 
 class HeatingInventory(BaseModel):
     ac_units: int = 0
@@ -24,6 +29,11 @@ class AIAnalysisResult(BaseModel):
     visual_red_flags: List[str] = []
     light_exposure: str
     confidence_score: int = Field(default=0, ge=0, le=100)
+    
+    # New Valuation Fields
+    net_area_sqm: float = 0.0
+    act16_due_date: Optional[str] = None # e.g. "2027-04"
+    is_panel_block: bool = False
 
 class GeoVerification(BaseModel):
     match: bool

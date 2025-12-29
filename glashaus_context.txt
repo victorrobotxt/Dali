@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Mon Dec 29 09:51:32 EET 2025
+Mon Dec 29 12:06:56 EET 2025
 
 
 --- GIT HISTORY ---
-* 8a82ecf (HEAD -> main) chore(maint): cleanup workspace and update project context
+* 4ab8a35 (HEAD -> main) docs: sync architecture and specs with v1.1 codebase state
+* 8a82ecf chore(maint): cleanup workspace and update project context
 * 3f8b25f refactor(config): externalize model configuration - Move hardcoded model name to src/core/config.py - Set default model to 'gemini-3.0-flash' (Current Gen) - Update GeminiService to use settings.GEMINI_MODEL
 * 0201f30 feat(pipeline): integrate unified 3D municipal audit into worker task
 * 9ac15c3 feat(forensics): implement 3D audit with live NAG registries - Add Expropriation check (The Death List) - Add Act 16 check (The Green List) - Add Building Permits check - Update headers to match browser emulation (X-Requested-With)
@@ -22,7 +23,6 @@ Mon Dec 29 09:51:32 EET 2025
 * ed4950e feat(forensics): harden backend with LexSofia logic and municipal registry strikes
 * 00b1e10 feat(reporting): integrate forensic registry checks into Legal Brief generation
 * e3f1eaf fix(services): implement circuit breakers for government registry availability
-* 6c7c90c feat(forensics): implement live registry verification and v2 risk engine
 
 
 --- FILE STRUCTURE ---
@@ -49,6 +49,7 @@ Mon Dec 29 09:51:32 EET 2025
 │   ├── headers.txt
 │   └── page_utf8.html
 ├── glashaus_context.txt
+├── index.html
 ├── manual_session_audit.py
 ├── nginx
 │   └── nginx.conf
@@ -98,7 +99,7 @@ Mon Dec 29 09:51:32 EET 2025
 └── tests
     └── test_api.py
 
-16 directories, 55 files
+16 directories, 56 files
 
 
 --- FILE CONTENTS ---
@@ -112,34 +113,46 @@ FILE: ./docs/ARCHITECTURE.md
 ## Core Logic Flow (Forensic Loop)
 The system uses an Event-Driven architecture to orchestrate parallel forensic checks.
 
-1. **Ingest & Normalize:** - Scraper Service fetches URL (handling `windows-1251` encoding).
-   - URLs are normalized (mobile subdomain enforcement) and deduplicated via content hash.
+1. **Ingest & Normalize:**
+   - [span_0](start_span)Scraper Service fetches URL (handling `windows-1251` encoding)[span_0](end_span).
+   - [span_1](start_span)[span_2](start_span)URLs are normalized (mobile subdomain enforcement) and deduplicated via content hash[span_1](end_span)[span_2](end_span).
 
 2. **The "Forensic Audit" Task (Celery Worker):**
-   Unlike the initial design, the system now runs a **consolidated parallel audit** rather than a tiered fallback.
-   - **Step A: Text Analysis (Gemini Flash):** Extracts unstructured data (Address, Construction Year, Atelier status).
-   - **Step B: Official Registry Checks (Async/Parallel):**
-     - **Cadastre Service:** Verifies official area vs advertised area using the extracted address.
-     - **City Risk Service (NAG):** Checks Sofia Municipal records for Expropriation (seizure) risks.
-     - **Compliance Service:** Verifies "Act 16" (Commissioning Certificate) status against the cadastral ID.
-   - **Step C: Risk Engine V2:**
-     - Merges all data points to calculate a composite `Risk Score` (0-100).
-     - Identifies "Fatal" flags (e.g., Expropriation = 100% Risk).
+   [span_3](start_span)[span_4](start_span)The system runs a **consolidated parallel audit** combining OSINT and Official Registry data[span_3](end_span)[span_4](end_span).
+   
+   - **Step A: Multimodal AI Analysis (Gemini 3.0 Flash):**
+     - **[span_5](start_span)[span_6](start_span)[span_7](start_span)Vision:** Detects "Atelier" traps, estimates construction year, and performs inventory counts (AC/Radiators)[span_5](end_span)[span_6](end_span)[span_7](end_span).
+     - **[span_8](start_span)Text:** Extracts unstructured data (Address, Construction Year, Heating types)[span_8](end_span).
+   
+   - **Step B: Geospatial Triangulation:**
+     - [span_9](start_span)[span_10](start_span)Cross-references AI-detected landmarks against the claimed neighborhood using Google Maps Geocoding[span_9](end_span)[span_10](end_span).
+   
+   - **Step C: Unified Municipal Audit (NAG Registry):**
+     - **[span_11](start_span)[span_12](start_span)Expropriation Check (The "Death List"):** Checks for municipal seizure plans[span_11](end_span)[span_12](end_span).
+     - **[span_13](start_span)[span_14](start_span)Compliance Check (The "Green List"):** Verifies "Act 16" (Commissioning Certificate) status[span_13](end_span)[span_14](end_span).
+     - **[span_15](start_span)Permit History:** Scans for valid building permits[span_15](end_span).
+   
+   - **Step D: Risk Engine V2:**
+     - [span_16](start_span)[span_17](start_span)Merges all data points to calculate a composite `Risk Score` (0-100)[span_16](end_span)[span_17](end_span).
+     - **[span_18](start_span)Fatal Flags:** Immediate rejection (e.g., Active Expropriation)[span_18](end_span).
+     - **[span_19](start_span)[span_20](start_span)Discrepancy Flags:** Area Fraud (>25%), Missing Radiators vs. Central Heating claims[span_19](end_span)[span_20](end_span).
 
-3. **Report Generation:** - `AttorneyReportGenerator` synthesizes a human-readable legal brief from the structured forensic data.
+3. **Report Generation:**
+   - [span_21](start_span)[span_22](start_span)`AttorneyReportGenerator` synthesizes a human-readable legal brief from the structured forensic data[span_21](end_span)[span_22](end_span).
 
 ## Tech Stack
-- **Service Layer:** Python 3.11 (FastAPI)
-- **Asynchronous Task Queue:** Celery + Redis
-- **Database:** PostgreSQL + PostGIS (Spatial data)
-- **Resilience:** Circuit Breakers implemented for Government Registry downtime (handling `httpx.ConnectError`).
+- **[span_23](start_span)Service Layer:** Python 3.11 (FastAPI)[span_23](end_span)
+- **[span_24](start_span)Asynchronous Task Queue:** Celery + Redis[span_24](end_span)
+- **[span_25](start_span)Database:** PostgreSQL + PostGIS (Spatial data)[span_25](end_span)
+- **[span_26](start_span)[span_27](start_span)AI Model:** Google Gemini 3.0 Flash (Multimodal)[span_26](end_span)[span_27](end_span)
+- **[span_28](start_span)[span_29](start_span)Resilience:** Circuit Breakers implemented for Government Registry downtime[span_28](end_span)[span_29](end_span).
 
 ## Critical Components
 | Component | Function | Status |
 | :--- | :--- | :--- |
-| **Risk Engine** | Calculates score based on Area Fraud, Legal Status (Atelier), and Expropriation. | ✅ Implemented (V2) |
-| **Forensics Service** | Manages sessions with `nag.sofia.bg` and `kais.cadastre.bg`. | ✅ Implemented |
-| **Storage Service** | Archives listing images to disk/S3 for evidence preservation. | ✅ Implemented |
+| **Risk Engine** | Calculates score based on Area Fraud, Legal Status (Atelier), Expropriation, and Radiator/Heating mismatches. | [span_30](start_span)[span_31](start_span)✅ Implemented (V2)[span_30](end_span)[span_31](end_span) |
+| **SofiaMunicipalForensics** | Unified interface for `nag.sofia.bg` registries (Expropriation, Permits, Act 16). | [span_32](start_span)✅ Implemented[span_32](end_span) |
+| **CadastreForensics** | Handles "Social Housing" risk detection and ownership ratio scanning. | [span_33](start_span)✅ Implemented[span_33](end_span) |
 
 ## Database Schema (Live State)
 *Synced with `src/db/models.py` and Alembic Migrations 001-003.*
@@ -147,31 +160,31 @@ The system uses an Event-Driven architecture to orchestrate parallel forensic ch
 ### 1. Listings Table
 | Column | Type | Description |
 | :--- | :--- | :--- |
-| `id` | Integer | PK |
-| `source_url` | String | Unique Index |
-| `content_hash` | String(64) | **Idempotency**: SHA256(text + price) |
-| `price_bgn` | **Numeric(12,2)** | Financial precision (e.g., 150000.00) |
-| `advertised_area_sqm` | **Numeric(10,2)** | Area precision (e.g., 65.50) |
-| `description_raw` | Text | Full ad body |
+| `id` | Integer | [span_34](start_span)PK[span_34](end_span) |
+| `source_url` | String | [span_35](start_span)Unique Index[span_35](end_span) |
+| `content_hash` | String(64) | **[span_36](start_span)Idempotency**: SHA256(text + price)[span_36](end_span) |
+| `price_bgn` | **Numeric(12,2)** | [span_37](start_span)[span_38](start_span)Financial precision (e.g., 150000.00)[span_37](end_span)[span_38](end_span) |
+| `advertised_area_sqm` | **Numeric(10,2)** | [span_39](start_span)[span_40](start_span)Area precision (e.g., 65.50)[span_39](end_span)[span_40](end_span) |
+| `description_raw` | Text | [span_41](start_span)Full ad body[span_41](end_span) |
 
 ### 2. Reports Table
 | Column | Type | Description |
 | :--- | :--- | :--- |
-| `id` | Integer | PK |
-| `listing_id` | Integer | FK -> Listings |
-| `status` | Enum | `PENDING`, `PROCESSING`, `VERIFIED`, `MANUAL_REVIEW`, `REJECTED` |
-| `risk_score` | Integer | 0-100 (100 = Fatal) |
-| `ai_confidence_score` | Integer | 0-100 (Hallucination check) |
-| `cost_to_generate` | **Numeric(10,4)** | API Cost tracking (e.g., 0.0045 BGN) |
-| `discrepancy_details` | JSON | Specific flags (e.g. "Area mismatch > 25%") |
+| `id` | Integer | [span_42](start_span)PK[span_42](end_span) |
+| `listing_id` | Integer | [span_43](start_span)FK -> Listings[span_43](end_span) |
+| `status` | Enum | [span_44](start_span)`PENDING`, `PROCESSING`, `VERIFIED`, `MANUAL_REVIEW`, `REJECTED`[span_44](end_span) |
+| `risk_score` | Integer | [span_45](start_span)0-100 (100 = Fatal)[span_45](end_span) |
+| `ai_confidence_score` | Integer | [span_46](start_span)0-100 (Hallucination check)[span_46](end_span) |
+| `cost_to_generate` | **Numeric(10,4)** | [span_47](start_span)[span_48](start_span)API Cost tracking (e.g., 0.0045 BGN)[span_47](end_span)[span_48](end_span) |
+| `discrepancy_details` | JSON | [span_49](start_span)Specific flags (e.g. "Area mismatch > 25%")[span_49](end_span) |
 
 ### 3. Buildings Table (Registry Truth)
 | Column | Type | Description |
 | :--- | :--- | :--- |
-| `id` | Integer | PK |
-| `cadastre_id` | String | Unique Official ID |
-| `construction_year` | Integer | Registry confirmed year |
-| `latitude/longitude` | Float | Geocoded coordinates |
+| `id` | Integer | [span_50](start_span)PK[span_50](end_span) |
+| `cadastre_id` | String | [span_51](start_span)Unique Official ID[span_51](end_span) |
+| `construction_year` | Integer | [span_52](start_span)Registry confirmed year[span_52](end_span) |
+| `latitude/longitude` | Float | [span_53](start_span)Geocoded coordinates[span_53](end_span) |
 
 
 =========================================
@@ -267,33 +280,33 @@ paths:
 FILE: ./docs/LASTENHEFT_DE.md
 =========================================
 # LASTENHEFT: Projekt Glashaus
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** In Entwicklung
 
 ## 1. Einleitung
-Das Projekt "Glashaus" ist eine automatisierte Due-Diligence-Plattform für den Immobilienmarkt in Sofia. Ziel ist die Beseitigung von Informationsasymmetrien durch den Einsatz von OSINT und KI-gestützter Datenanalyse.
+[span_66](start_span)Das Projekt "Glashaus" ist eine automatisierte Due-Diligence-Plattform für den Immobilienmarkt in Sofia[span_66](end_span). Ziel ist die Beseitigung von Informationsasymmetrien durch den Einsatz von OSINT und multimodaler KI-Analyse.
 
 ## 2. Ist-Zustand (Problemstellung)
-- **Datenfragmentierung:** Grundbuch (Registry), Kataster (Cadastre) und Gemeinde agieren in Silos.
-- **Intransparenz:** Immobilienanzeigen enthalten oft ungenaue Flächenangaben und verschleierte Adressen.
+- **[span_67](start_span)Datenfragmentierung:** Grundbuch (Registry), Kataster (Cadastre) und Gemeinde (NAG) agieren in Silos[span_67](end_span).
+- **[span_68](start_span)Intransparenz:** Immobilienanzeigen enthalten oft ungenaue Flächenangaben, "Atelier"-Fallen und verschleierte Adressen[span_68](end_span).
 - **Prozessineffizienz:** Manuelle Prüfungen sind teuer und langsam.
 
 ## 3. Soll-Zustand (Lösung)
 Ein Microservices-System, das folgende Kernfunktionen bietet:
-1.  **Automatische Adress-Deduktion:** Ermittlung der exakten Adresse aus unstrukturierten Anzeigentexten und Bildern.
-2.  **Soll/Ist-Abgleich:** Automatischer Vergleich von Maklerangaben (Anzeige) mit amtlichen Katasterdaten.
-3.  **Risikobewertung:** Algorithmische Berechnung eines "Risk Scores" (0-100).
+1.  **[span_69](start_span)[span_70](start_span)Automatische Adress-Deduktion:** Ermittlung der exakten Adresse aus unstrukturierten Anzeigentexten und visueller Landmarken-Analyse[span_69](end_span)[span_70](end_span).
+2.  **[span_71](start_span)3D-Audit (Unified Forensics):** Gleichzeitige Prüfung von Kataster (Fläche), Gemeinde (Enteignung/Baugenehmigung) und Gesetz (Nutzungsstatus)[span_71](end_span).
+3.  **[span_72](start_span)Social Risk Detection:** Analyse der Eigentümerstruktur (Privat vs. Gemeinde) zur Erkennung von "Social Housing"-Risiken[span_72](end_span).
+4.  **[span_73](start_span)Risikobewertung:** Algorithmische Berechnung eines "Risk Scores" (0-100)[span_73](end_span).
 
 ## 4. Technische Anforderungen
-- **Architektur:** Event-Driven Microservices (Python/FastAPI).
-- **Datenbank:** PostgreSQL mit PostGIS für Geodatenverarbeitung.
+- **[span_74](start_span)Architektur:** Event-Driven Microservices (Python/FastAPI)[span_74](end_span).
+- **[span_75](start_span)Datenbank:** PostgreSQL mit PostGIS für Geodatenverarbeitung[span_75](end_span).
 - **KI-Integration:**
-    - *Tier 1:* Textanalyse (Low Cost / Gemini Flash).
-    - *Tier 2:* Visuelle Analyse (High Cost / Gemini Pro).
+    - **[span_76](start_span)[span_77](start_span)Multimodal Engine:** Google Gemini 3.0 Flash[span_76](end_span)[span_77](end_span). [span_78](start_span)Verarbeitet Text und Bilder simultan zur Erkennung von visuellen Diskrepanzen (z.B. "Luxus" im Text vs. "Panel" im Bild)[span_78](end_span).
 
 ## 5. Nicht-funktionale Anforderungen
-- **Idempotenz:** Wiederholte Uploads dürfen keine Datenkorruption verursachen.
-- **Skalierbarkeit:** Das System muss Warteschlangen (Queues) nutzen, um Lastspitzen bei Scrapern abzufangen.
+- **[span_79](start_span)Idempotenz:** Wiederholte Uploads dürfen keine Datenkorruption verursachen (`content_hash` Prüfungen)[span_79](end_span).
+- **[span_80](start_span)Skalierbarkeit:** Das System nutzt Celery/Redis Warteschlangen, um Lastspitzen bei Scrapern abzufangen[span_80](end_span).
 
 
 =========================================
@@ -303,34 +316,31 @@ FILE: ./docs/TECHNICAL_DEBT.md
 
 ## Critical Severity (Must Fix Before Beta)
 
-### 1. Hardcoded Secrets (Config)
-- **Location:** `src/core/config.py`
-- **Issue:** `GEMINI_API_KEY` defaults to "mock-key". While validated at runtime, this is bad practice.
-- **Fix:** Remove default value entirely and force `.env` loading.
-
-### 2. Scraper Fragility (DOM Coupling)
-- **Location:** `src/services/scraper_service.py` & `forensic_check.py`
-- **Issue:** Logic relies on specific HTML IDs (e.g., `id='price'`, `id='description_div'`).
-- **Risk:** High. If `imot.bg` updates their frontend classes, the "Space Hack" and Price normalization logic will fail silently.
+### 1. Scraper Fragility (DOM Coupling)
+- **Location:** `src/services/scraper_service.py`
+- **Issue:** Logic relies on specific HTML IDs or classes (e.g., `.price`).
+- **Risk:** High. If `imot.bg` updates their frontend classes, extraction fails.
 - **Fix:** Implement multi-selector fallbacks or move strictly to Visual DOM analysis (Gemini Vision) for extraction.
+- **[span_54](start_span)[span_55](start_span)Update:** Mobile subdomain enforcement (`m.imot.bg`) has improved stability[span_54](end_span)[span_55](end_span).
 
-## Moderate Severity (Optimization)
-
-### 3. Synchronous Registry Calls in Loops
-- **Location:** `src/services/forensics_service.py`
-- **Issue:** While the task itself is async, some specialized sub-checks might still block the event loop if not strictly awaited.
-- **Fix:** Audit all `httpx` calls to ensure `await` is used consistently across the `gather()` chain.
+### 2. Hardcoded Secrets (Config)
+- **Location:** `src/core/config.py`
+- **[span_56](start_span)[span_57](start_span)Issue:** `GEMINI_API_KEY` type hint implies no default, but mock keys or defaults exist in code logic[span_56](end_span)[span_57](end_span).
+- **Fix:** Ensure strict environment variable enforcement in production Docker builds.
 
 ## Resolved Items (Fixed)
 
+### ✅ Synchronous Registry Calls
+- **[span_58](start_span)Fix:** `SofiaMunicipalForensics` (`src/services/forensics_service.py`) now uses `asyncio.gather` to run Expropriation, Act 16, and Permit checks in parallel[span_58](end_span).
+
 ### ✅ Database Session Scope in Background Tasks
-- **Fix:** `src/tasks.py` now explicitly initializes a thread-safe session using `with SessionLocal() as db:` inside the Celery worker.
+- **[span_59](start_span)[span_60](start_span)Fix:** `src/tasks.py` explicitly initializes thread-safe sessions using `with SessionLocal() as db:`[span_59](end_span)[span_60](end_span).
 
 ### ✅ Risk Scoring Algorithm
-- **Fix:** `RiskEngine` (V2) is implemented (`src/services/risk_engine.py`). It now calculates scores based on Expropriation (Fatal), Act 16 status, and Area discrepancy > 25%.
+- **[span_61](start_span)[span_62](start_span)Fix:** `RiskEngine` (V2) implemented in `src/services/risk_engine.py`[span_61](end_span)[span_62](end_span). [span_63](start_span)[span_64](start_span)Includes checks for "Infrastructure Mismatch" (Radiators) and "Location Fraud"[span_63](end_span)[span_64](end_span).
 
-### ✅ Listing Normalization
-- **Fix:** `RealEstateRepository` now normalizes URLs (forcing mobile subdomains) and checks for duplicates before insertion.
+### ✅ Financial & Area Precision
+- **[span_65](start_span)Fix:** Database schema migrated to `NUMERIC(12,2)` for price and `NUMERIC(10,2)` for area (Migration 002 & 003)[span_65](end_span).
 
 
 =========================================
@@ -2391,6 +2401,181 @@ redis==5.0.1
 alembic==1.13.1
 Pillow==10.2.0
 structlog>=24.1.0
+
+
+=========================================
+FILE: ./index.html
+=========================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GLASHAUS // INTEL</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap');
+        
+        body { 
+            font-family: 'JetBrains Mono', monospace; 
+            background-color: #050505; 
+            color: #E5E5E5;
+            overflow-x: hidden;
+        }
+
+        /* PALANTIR AESTHETIC COLORS */
+        .tech-blue { color: #00F0FF; text-shadow: 0 0 10px rgba(0, 240, 255, 0.3); }
+        .tech-amber { color: #FFB000; }
+        .border-tech { border: 1px solid #222; }
+        
+        /* BACKGROUND GRID */
+        .grid-bg { 
+            background-image: 
+                linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+            background-size: 40px 40px;
+        }
+
+        /* CRT SCANLINE EFFECT */
+        .scanline {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: linear-gradient(
+                to bottom,
+                rgba(255,255,255,0),
+                rgba(255,255,255,0) 50%,
+                rgba(0,0,0,0.2) 50%,
+                rgba(0,0,0,0.2)
+            );
+            background-size: 100% 4px;
+            pointer-events: none;
+            z-index: 50;
+            opacity: 0.3;
+        }
+
+        /* BLINKING CURSOR */
+        .cursor-blink { 
+            animation: blink 1s step-end infinite; 
+            display: inline-block;
+            vertical-align: text-bottom;
+            width: 10px;
+            height: 1.2em;
+            background-color: #00F0FF;
+        }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+        /* HOVER STATES */
+        .module-card:hover {
+            border-color: #00F0FF;
+            background-color: rgba(0, 240, 255, 0.02);
+            transform: translateY(-2px);
+        }
+    </style>
+</head>
+<body class="grid-bg min-h-screen flex flex-col justify-between relative selection:bg-cyan-900 selection:text-white">
+
+    <div class="scanline"></div>
+
+    <!-- HEADER -->
+    <nav class="flex justify-between items-center p-6 border-b border-gray-900 bg-black/90 backdrop-blur-sm relative z-10">
+        <div class="text-lg font-bold tracking-tighter flex items-center gap-2">
+            GLASHAUS <span class="text-gray-700">//</span> ONTOLOGY v1.0<span class="cursor-blink"></span>
+        </div>
+        <div class="text-[10px] uppercase tracking-widest text-gray-500 flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+            System Status: Operational
+        </div>
+    </nav>
+
+    <!-- HERO SECTION -->
+    <main class="flex-grow flex flex-col justify-center px-6 lg:px-20 max-w-7xl mx-auto w-full relative z-10 py-20">
+        
+        <div class="mb-6 fade-in">
+            <span class="border border-gray-800 bg-gray-900/50 text-[10px] font-bold px-3 py-1 text-gray-400 uppercase tracking-[0.2em]">
+                Classified: Institutional Tier
+            </span>
+        </div>
+
+        <h1 class="text-6xl md:text-8xl font-bold leading-none tracking-tighter mb-8 text-white">
+            THE SOFIA<br>
+            <span class="text-gray-800">DOCTRINE.</span>
+        </h1>
+
+        <p class="text-lg md:text-xl text-gray-500 max-w-2xl mb-16 leading-relaxed font-light">
+            Eliminating information asymmetry in the Balkan Capital Market. 
+            <span class="text-gray-300">From satellite orbit to the radiator valve.</span>
+            Automated forensic visibility for the sovereign investor.
+        </p>
+
+        <!-- MODULES -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-16">
+            
+            <!-- CARD 01 -->
+            <div class="module-card border-tech p-8 transition duration-300 cursor-crosshair">
+                <div class="text-gray-600 text-[10px] font-bold mb-4 uppercase tracking-widest flex justify-between">
+                    Module / 01
+                    <span class="tech-amber">● LIVE</span>
+                </div>
+                <h3 class="text-2xl font-bold mb-3 text-white">INSOLVENCY RADAR</h3>
+                <p class="text-xs text-gray-400 leading-6">
+                    Real-time liquidity stress testing for developer entities. Identifying the "living dead" via debt-to-inventory ratio analysis before the default event occurs.
+                </p>
+            </div>
+
+            <!-- CARD 02 -->
+            <div class="module-card border-tech p-8 transition duration-300 cursor-crosshair">
+                <div class="text-gray-600 text-[10px] font-bold mb-4 uppercase tracking-widest flex justify-between">
+                    Module / 02
+                    <span class="tech-blue">● ACTIVE</span>
+                </div>
+                <h3 class="text-2xl font-bold mb-3 text-white">TOXIC COLLATERAL</h3>
+                <p class="text-xs text-gray-400 leading-6">
+                    Automated detection of "Atelier" status, expropriation risk (The Death List), and Act 16 voids using multimodal AI vision and registry cross-referencing.
+                </p>
+            </div>
+
+            <!-- CARD 03 -->
+            <div class="module-card border-tech p-8 transition duration-300 cursor-crosshair">
+                <div class="text-gray-600 text-[10px] font-bold mb-4 uppercase tracking-widest flex justify-between">
+                    Module / 03
+                    <span class="text-gray-500">● MAPPING</span>
+                </div>
+                <h3 class="text-2xl font-bold mb-3 text-white">SHADOW LAND BANK</h3>
+                <p class="text-xs text-gray-400 leading-6">
+                    Predictive acquisition modeling. Mapping municipal "Private Property" parcels before they hit the public tender.
+                </p>
+            </div>
+
+        </div>
+
+        <div class="flex gap-4">
+            <button class="bg-white text-black px-8 py-4 font-bold uppercase tracking-widest text-xs hover:bg-gray-200 transition">
+                Authenticate
+            </button>
+            <button class="border border-gray-800 text-gray-500 px-8 py-4 font-bold uppercase tracking-widest text-xs hover:text-white hover:border-gray-500 transition">
+                View Protocol
+            </button>
+        </div>
+
+    </main>
+
+    <!-- FOOTER -->
+    <footer class="p-6 text-[10px] text-gray-700 border-t border-gray-900 flex justify-between uppercase tracking-widest relative z-10">
+        <div class="flex gap-6">
+            <span>Latency: 12ms</span>
+            <span>Node: ZURICH</span>
+            <span>Encryption: AES-256</span>
+        </div>
+        <div>
+            © 2024 GLASHAUS INTELLIGENCE
+        </div>
+    </footer>
+
+</body>
+</html>
 
 
 =========================================

@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GLASHAUS // INTEL</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap');
+        
+        body { 
+            font-family: 'JetBrains Mono', monospace; 
+            background-color: #050505; 
+            color: #E5E5E5;
+            overflow-x: hidden;
+        }
+
+        /* PALANTIR AESTHETIC COLORS */
+        .tech-blue { color: #00F0FF; text-shadow: 0 0 10px rgba(0, 240, 255, 0.3); }
+        .tech-amber { color: #FFB000; }
+        .border-tech { border: 1px solid #222; }
+        
+        /* BACKGROUND GRID */
+        .grid-bg { 
+            background-image: 
+                linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+            background-size: 40px 40px;
+        }
+
+        /* CRT SCANLINE EFFECT */
+        .scanline {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: linear-gradient(
+                to bottom,
+                rgba(255,255,255,0),
+                rgba(255,255,255,0) 50%,
+                rgba(0,0,0,0.2) 50%,
+                rgba(0,0,0,0.2)
+            );
+            background-size: 100% 4px;
+            pointer-events: none;
+            z-index: 50;
+            opacity: 0.3;
+        }
+
+        /* BLINKING CURSOR */
+        .cursor-blink { 
+            animation: blink 1s step-end infinite; 
+            display: inline-block;
+            vertical-align: text-bottom;
+            width: 10px;
+            height: 1.2em;
+            background-color: #00F0FF;
+        }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+        /* HOVER STATES */
+        .module-card:hover {
+            border-color: #00F0FF;
+            background-color: rgba(0, 240, 255, 0.02);
+            transform: translateY(-2px);
+        }
+    </style>
+</head>
+<body class="grid-bg min-h-screen flex flex-col justify-between relative selection:bg-cyan-900 selection:text-white">
+
+    <div class="scanline"></div>
+
+    <!-- HEADER -->
+    <nav class="flex justify-between items-center p-6 border-b border-gray-900 bg-black/90 backdrop-blur-sm relative z-10">
+        <div class="text-lg font-bold tracking-tighter flex items-center gap-2">
+            GLASHAUS <span class="text-gray-700">//</span> ONTOLOGY v1.0<span class="cursor-blink"></span>
+        </div>
+        <div class="text-[10px] uppercase tracking-widest text-gray-500 flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+            System Status: Operational
+        </div>
+    </nav>
+
+    <!-- HERO SECTION -->
+    <main class="flex-grow flex flex-col justify-center px-6 lg:px-20 max-w-7xl mx-auto w-full relative z-10 py-20">
+        
+        <div class="mb-6 fade-in">
+            <span class="border border-gray-800 bg-gray-900/50 text-[10px] font-bold px-3 py-1 text-gray-400 uppercase tracking-[0.2em]">
+                Classified: Institutional Tier
+            </span>
+        </div>
+
+        <h1 class="text-6xl md:text-8xl font-bold leading-none tracking-tighter mb-8 text-white">
+            THE SOFIA<br>
+            <span class="text-gray-800">DOCTRINE.</span>
+        </h1>
+
+        <p class="text-lg md:text-xl text-gray-500 max-w-2xl mb-16 leading-relaxed font-light">
+            Eliminating information asymmetry in the Balkan Capital Market. 
+            <span class="text-gray-300">From satellite orbit to the radiator valve.</span>
+            Automated forensic visibility for the sovereign investor.
+        </p>
+
+        <!-- MODULES -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-16">
+            
+            <!-- CARD 01 -->
+            <div class="module-card border-tech p-8 transition duration-300 cursor-crosshair">
+                <div class="text-gray-600 text-[10px] font-bold mb-4 uppercase tracking-widest flex justify-between">
+                    Module / 01
+                    <span class="tech-amber">● LIVE</span>
+                </div>
+                <h3 class="text-2xl font-bold mb-3 text-white">INSOLVENCY RADAR</h3>
+                <p class="text-xs text-gray-400 leading-6">
+                    Real-time liquidity stress testing for developer entities. Identifying the "living dead" via debt-to-inventory ratio analysis before the default event occurs.
+                </p>
+            </div>
+
+            <!-- CARD 02 -->
+            <div class="module-card border-tech p-8 transition duration-300 cursor-crosshair">
+                <div class="text-gray-600 text-[10px] font-bold mb-4 uppercase tracking-widest flex justify-between">
+                    Module / 02
+                    <span class="tech-blue">● ACTIVE</span>
+                </div>
+                <h3 class="text-2xl font-bold mb-3 text-white">TOXIC COLLATERAL</h3>
+                <p class="text-xs text-gray-400 leading-6">
+                    Automated detection of "Atelier" status, expropriation risk (The Death List), and Act 16 voids using multimodal AI vision and registry cross-referencing.
+                </p>
+            </div>
+
+            <!-- CARD 03 -->
+            <div class="module-card border-tech p-8 transition duration-300 cursor-crosshair">
+                <div class="text-gray-600 text-[10px] font-bold mb-4 uppercase tracking-widest flex justify-between">
+                    Module / 03
+                    <span class="text-gray-500">● MAPPING</span>
+                </div>
+                <h3 class="text-2xl font-bold mb-3 text-white">SHADOW LAND BANK</h3>
+                <p class="text-xs text-gray-400 leading-6">
+                    Predictive acquisition modeling. Mapping municipal "Private Property" parcels before they hit the public tender.
+                </p>
+            </div>
+
+        </div>
+
+        <div class="flex gap-4">
+            <button class="bg-white text-black px-8 py-4 font-bold uppercase tracking-widest text-xs hover:bg-gray-200 transition">
+                Authenticate
+            </button>
+            <button class="border border-gray-800 text-gray-500 px-8 py-4 font-bold uppercase tracking-widest text-xs hover:text-white hover:border-gray-500 transition">
+                View Protocol
+            </button>
+        </div>
+
+    </main>
+
+    <!-- FOOTER -->
+    <footer class="p-6 text-[10px] text-gray-700 border-t border-gray-900 flex justify-between uppercase tracking-widest relative z-10">
+        <div class="flex gap-6">
+            <span>Latency: 12ms</span>
+            <span>Node: ZURICH</span>
+            <span>Encryption: AES-256</span>
+        </div>
+        <div>
+            © 2024 GLASHAUS INTELLIGENCE
+        </div>
+    </footer>
+
+</body>
+</html>
