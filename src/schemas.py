@@ -14,6 +14,13 @@ class ScrapedListing(BaseModel):
     is_vat_excluded: bool = False
     is_direct_owner: bool = False
     price_correction_note: Optional[str] = None
+    
+    def model_dump(self, **kwargs):
+        # Ensure Decimal is handled for Risk Engine which expects floats
+        d = super().model_dump(**kwargs)
+        d['price_predicted'] = float(d['price_predicted'])
+        d['area_sqm'] = float(d['area_sqm'])
+        return d
 
 class HeatingInventory(BaseModel):
     ac_units: int = 0
@@ -28,6 +35,8 @@ class AIAnalysisResult(BaseModel):
     neighborhood_match: str = "Unknown"
     building_type: str = "Unknown"
     is_panel_block: bool = False
+    construction_year_est: int = 0
+    ceiling_height: float = 0.0
     heating_inventory: HeatingInventory = Field(default_factory=HeatingInventory)
     net_area_sqm: float = 0.0
     act16_due_date: Optional[str] = None
@@ -37,7 +46,6 @@ class AIAnalysisResult(BaseModel):
 
 class GeoVerification(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    
     match: bool
     detected_neighborhood: str
     confidence: int
@@ -48,7 +56,6 @@ class GeoVerification(BaseModel):
 
 class CadastreData(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    
     official_area: float = 0.0
     cadastre_id: Optional[str] = None
     status: Literal["LIVE", "OFFLINE", "NOT_FOUND", "ERROR"] = "NOT_FOUND"

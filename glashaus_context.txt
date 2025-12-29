@@ -1,9 +1,12 @@
 --- GLASHAUS PROJECT DUMP ---
-Mon Dec 29 20:52:41 EET 2025
+Mon Dec 29 21:35:03 EET 2025
 
 
 --- GIT HISTORY ---
-* 7dc2478 (HEAD -> main, origin/main) feat(ai): implement gemini file api for multimodal forensics
+* 60ccbaf (HEAD -> main, origin/main) refactor(core): migrate dataclasses to Pydantic v2 and harden AI validation
+* 39c1d50 refactor(core): migrate dataclasses to Pydantic v2 and harden AI validation
+* d3c3668 fix(forensics): restore CadastreService and resolve file truncation
+* 7dc2478 feat(ai): implement gemini file api for multimodal forensics
 * 7fd0a77 feat(legal): implement deterministic validator engine
 * c19710d refactor(core): harden config security and dynamic db url
 * 9baf4be feat(scraper): switch to desktop protocol v2 (regex+1251)
@@ -20,9 +23,6 @@ Mon Dec 29 20:52:41 EET 2025
 * 698eb25 refactor(core): implement hybrid scraping fallback and multimodal AI forensics
 * 6f470a6 refactor(core): production hardening, type safety, and architecture cleanup
 * 0f7d54d refactor(core): production hardening, type safety, and architecture cleanup
-* d13df83 refactor(core): harden security, async concurrency, and financial precision
-* 5a71d4d refactor(core): promote prototype to production-ready architecture
-* fdd6519 docs: update architecture, API contract, and debt log to match V1 state
 
 
 --- FILE STRUCTURE ---
@@ -47,10 +47,10 @@ Mon Dec 29 20:52:41 EET 2025
 │   ├── TECHNICAL_DEBT.md
 │   └── api_contract.yaml
 ├── forensics
-│   ├── headers.txt
-│   └── page_utf8.html
+│   └── headers.txt
 ├── glashaus_context.txt
 ├── index.html
+├── law.txt
 ├── manual_session_audit.py
 ├── nginx
 │   └── nginx.conf
@@ -633,92 +633,43 @@ import json
 import asyncio
 from src.core.logger import logger
 from src.core.config import settings
+from src.schemas import AIAnalysisResult
 
 class GeminiService:
     def __init__(self, api_key: str):
         genai.configure(api_key=api_key)
-        # Use the config value (defaults to gemini-3.0-flash)
         self.model = genai.GenerativeModel(settings.GEMINI_MODEL)
 
-    async def analyze_listing_multimodal(self, text_content: str, image_paths: List[str]) -> Dict[str, Any]:
-        """
-        Analyzes listing text + images using the Gemini File API.
-        Uploads images -> Analyzes -> Cleans up remote files.
-        """
+    async def analyze_listing_multimodal(self, text_content: str, image_paths: List[str]) -> AIAnalysisResult:
         log = logger.bind(model=settings.GEMINI_MODEL)
         log.info("starting_multimodal_analysis", image_count=len(image_paths))
         
-        # Construct the prompt for the Digital Attorney
-        prompt = f"""
-        You are an expert Real Estate Forensic Auditor in Sofia, Bulgaria.
-        Analyze this listing text and the attached images.
-        
-        TEXT:
-        {text_content}
-        
-        TASK:
-        1. Extract the likely address (Street, Number, Neighborhood).
-        2. Estimate construction year based on visual style (Panel vs Brick).
-        3. Detect "Atelier" status traps (North facing, small windows).
-        4. Identify "Visual Lies": Does the text say "Luxury" but images show "Panel"?
-        5. Heating Inventory: Count visible AC units and Radiators.
-
-        Return JSON only:
-        {{
-            "address_prediction": "str",
-            "construction_year_est": int,
-            "is_panel_block": bool,
-            "is_atelier_trap": bool,
-            "visual_defects": ["str"],
-            "landmarks": ["str"],
-            "heating_inventory": {{
-                "ac_units": int,
-                "radiators": int
-            }}
-        }}
-        """
+        prompt = f"Analyze this listing text and images. Return JSON ONLY matching our forensic schema.\nTEXT:\n{text_content}"
         
         uploaded_files = []
-        
         try:
-            # A. UPLOAD PHASE
-            # We use asyncio.to_thread because the Google SDK upload is blocking I/O
             for path in image_paths:
-                try:
-                    log.debug("uploading_image", path=path)
-                    # Upload using the File API (handles < 20MB constraint of inline)
-                    file_ref = await asyncio.to_thread(genai.upload_file, path=path)
-                    uploaded_files.append(file_ref)
-                except Exception as upload_err:
-                    log.error("image_upload_failed", path=path, error=str(upload_err))
+                file_ref = await asyncio.to_thread(genai.upload_file, path=path)
+                uploaded_files.append(file_ref)
 
-            if not uploaded_files:
-                log.warning("no_images_uploaded_proceeding_text_only")
-
-            # B. INFERENCE PHASE
-            # Combine prompt + file handles
             parts = [prompt, *uploaded_files]
-            
             response = await asyncio.to_thread(self.model.generate_content, parts)
             
-            # C. CLEANUP PHASE
-            # Delete files from Google's servers immediately after use
+            # Cleanup remote files
             for f in uploaded_files:
-                try:
-                    await asyncio.to_thread(genai.delete_file, f.name)
-                except Exception as cleanup_err:
-                    log.warning("cleanup_failed", file=f.name, error=str(cleanup_err))
+                await asyncio.to_thread(genai.delete_file, f.name)
 
-            # D. PARSING
-            cleaned_text = response.text.replace('```json', '').replace('```', '')
-            return json.loads(cleaned_text)
+            # JSON Sanitization
+            raw_json = response.text.replace('```json', '').replace('```', '').strip()
+            data = json.loads(raw_json)
+            
+            # STRICT VALIDATION
+            return AIAnalysisResult(**data)
             
         except Exception as e:
-            log.error("ai_analysis_failed_fatal", error=str(e))
-            return {
-                "address_prediction": "Unknown",
-                "error": str(e)
-            }
+            log.error("ai_analysis_failed", error=str(e))
+            # Fallback to empty validated object
+            return AIAnalysisResult(address_prediction="Unknown", landmarks=[])
 
 
 =========================================
@@ -1008,6 +959,93 @@ class RiskEngine:
 =========================================
 FILE: ./src/services/cadastre_service.py
 =========================================
+import asyncio
+import re
+import httpx
+from bs4 import BeautifulSoup
+from src.schemas import CadastreData
+from src.core.logger import logger
+
+class CadastreService:
+    """Registry Forensics: human address -> Official registry truth (KAIS)."""
+    
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': 'https://kais.cadastre.bg/bg/Map'
+        }
+
+    async def get_official_details(self, address: str) -> CadastreData:
+        """
+        Executes a 5-step handshake with the Cadastre registry to bypass CSRF 
+        and extract official area data.
+        """
+        log = logger.bind(target_address=address)
+        
+        try:
+            # Handshake 1: Initialize Session and Grab CSRF Token
+            resp = await self.client.get("https://kais.cadastre.bg/bg/Map", headers=self.headers)
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            token_tag = soup.find('input', {'name': '__RequestVerificationToken'})
+            
+            if not token_tag:
+                log.error("kais_csrf_token_missing")
+                return CadastreData(status="ERROR", official_area=0.0)
+                
+            token = token_tag.get('value')
+            
+            # Handshake 2: Execute "FastSearch" (primes the server-side result state)
+            await self.client.get(
+                "https://kais.cadastre.bg/bg/Map/FastSearch", 
+                params={'KeyWords': address}, 
+                headers=self.headers
+            )
+            # Essential delay to prevent rate-limiting/bot detection
+            await asyncio.sleep(0.6) 
+            
+            # Handshake 3: Read the primed search results
+            read_headers = {**self.headers, 'X-CSRF-TOKEN': token}
+            res = await self.client.post(
+                "https://kais.cadastre.bg/bg/Map/ReadFoundObjects", 
+                data={'page': 1, 'pageSize': 5}, 
+                headers=read_headers
+            )
+            data = res.json()
+            
+            if not data.get('Data') or len(data['Data']) == 0: 
+                log.warning("cadastre_not_found")
+                return CadastreData(status="NOT_FOUND", official_area=0.0)
+
+            # Handshake 4: Fetch detailed info for the first (best) match
+            obj = data['Data'][0]
+            info_resp = await self.client.get(
+                "https://kais.cadastre.bg/bg/Map/GetObjectInfo", 
+                params=obj, 
+                headers=self.headers
+            )
+            
+            # Handshake 5: Extract official area using Bulgarian regex
+            # Looks for "площ [number] кв.м" or "площ по документ [number] кв.м"
+            area_match = re.search(r"площ(?: по документ)?\s*([\d\.]+)\s*кв\.?\s*м", info_resp.text, re.IGNORECASE)
+            area = float(area_match.group(1)) if area_match else 0.0
+            
+            log.info("cadastre_resolved", id=obj.get('Number'), area=area)
+
+            return CadastreData(
+                cadastre_id=obj.get('Number'),
+                official_area=area,
+                address_found=obj.get('Address'),
+                status="LIVE"
+            )
+            
+        except (httpx.TimeoutException, httpx.ConnectError):
+            log.warning("cadastre_registry_timeout")
+            return CadastreData(status="OFFLINE", official_area=0.0)
+        except Exception as e:
+            log.error("cadastre_analysis_failed", error=str(e))
+            return CadastreData(status="ERROR", official_area=0.0)
 
 
 =========================================
@@ -1836,39 +1874,36 @@ async def run_audit_pipeline(listing_id: int):
             listing = db.query(Listing).get(listing_id)
             if not listing: return "Error: Listing not found"
 
-            # 1. SCRAPE
+            # 1. SCRAPE (Returns ScrapedListing)
             scraper = ScraperService(client=http_client)
             scraped_data = await scraper.scrape_url(listing.source_url)
             
-            # 2. VISION
+            # 2. VISION (Returns AIAnalysisResult)
             storage = StorageService()
             img_paths = await storage.archive_images(listing_id, scraped_data.image_urls)
             ai_service = GeminiService(api_key=settings.GEMINI_API_KEY)
             ai_data = await ai_service.analyze_listing_multimodal(scraped_data.raw_text, img_paths)
             
-            # 3. GEO TRIANGULATION
+            # 3. GEO TRIANGULATION (Returns GeoVerification)
             geo_service = GeospatialService(api_key=settings.GOOGLE_MAPS_API_KEY)
             geo_report = await geo_service.verify_neighborhood(
-                ai_data.get("address_prediction"), 
-                ai_data.get("landmarks", []), 
+                ai_data.address_prediction, 
+                ai_data.landmarks, 
                 scraped_data.neighborhood
             )
             
-            # 4. REGISTRY (LINEAR)
+            # 4. REGISTRY (Returns CadastreData)
             cadastre = CadastreService(client=http_client)
-            best_address = normalize_sofia_street(geo_report.best_address or ai_data.get("address_prediction"))
+            best_address = normalize_sofia_street(geo_report.best_address or ai_data.address_prediction)
             cad_data = await cadastre.get_official_details(best_address)
             
-            # NEW: UNIFIED MUNICIPAL AUDIT
             mun_report = {"expropriation": {}, "compliance_act16": {}}
             building_id = None
             
             if cad_data.cadastre_id:
-                # Parallel Municipal Strike
                 forensics = SofiaMunicipalForensics(client=http_client)
                 mun_report = await forensics.run_full_audit(cad_data.cadastre_id)
                 
-                # Persist Building Context
                 existing_building = db.query(Building).filter(Building.cadastre_id == cad_data.cadastre_id).first()
                 if not existing_building:
                     new_building = Building(
@@ -1876,7 +1911,7 @@ async def run_audit_pipeline(listing_id: int):
                         address_full=cad_data.address_found or geo_report.best_address,
                         latitude=geo_report.lat,
                         longitude=geo_report.lng,
-                        construction_year=ai_data.get("construction_year_est")
+                        construction_year=0 # AI data would go here
                     )
                     db.add(new_building)
                     db.flush()
@@ -1884,22 +1919,26 @@ async def run_audit_pipeline(listing_id: int):
                 else:
                     building_id = existing_building.id
 
-            # 5. SCORING
+            # 5. SCORING (Bundle Pydantic objects converted to dicts)
             forensic_data = {
                 "scraped": scraped_data.model_dump(),
-                "ai": ai_data,
+                "ai": ai_data.model_dump(),
                 "geo": geo_report.model_dump(),
                 "cadastre": cad_data.model_dump(),
-                # Map new service output to Risk Engine expected keys
                 "compliance": mun_report.get("compliance_act16", {}),
                 "city_risk": mun_report.get("expropriation", {})
             }
+            
             risk_engine = RiskEngine()
             score_res = risk_engine.calculate_score_v2(forensic_data)
             
             # 6. REPORTING
             report_gen = AttorneyReportGenerator()
-            report_text = report_gen.generate_legal_brief(scraped_data.model_dump(), {**score_res, "forensics": forensic_data}, ai_data)
+            report_text = report_gen.generate_legal_brief(
+                scraped_data.model_dump(), 
+                {**score_res, "forensics": forensic_data}, 
+                ai_data.model_dump()
+            )
             
             new_report = Report(
                 listing_id=listing_id,
@@ -1918,58 +1957,46 @@ async def run_audit_pipeline(listing_id: int):
 =========================================
 FILE: ./src/schemas.py
 =========================================
-from dataclasses import dataclass, field
+from pydantic import BaseModel, Field, ConfigDict
 from decimal import Decimal
 from typing import List, Optional, Literal
 
-@dataclass
-class ScrapedListing:
+class ScrapedListing(BaseModel):
+    model_config = ConfigDict(from_attributes=True, arbitrary_types_allowed=True)
+    
     source_url: str
     raw_text: str
     price_predicted: Decimal
     area_sqm: Decimal
     neighborhood: str 
-    image_urls: List[str] = field(default_factory=list)
-    
-    # Forensic Fields
+    image_urls: List[str] = Field(default_factory=list)
     is_vat_excluded: bool = False
     is_direct_owner: bool = False
     price_correction_note: Optional[str] = None
-    
-    # Helper to mimic Pydantic's .model_dump()
-    def model_dump(self):
-        return {
-            k: (float(v) if isinstance(v, Decimal) else v) 
-            for k, v in self.__dict__.items()
-        }
 
-@dataclass
-class HeatingInventory:
+class HeatingInventory(BaseModel):
     ac_units: int = 0
     radiators: int = 0
     has_central_heating: bool = False
 
-@dataclass
-class AIAnalysisResult:
-    address_prediction: str
-    neighborhood_match: str
-    building_type: str
-    heating_inventory: HeatingInventory
-    light_exposure: str
-    landmarks: List[str] = field(default_factory=list)
-    visual_red_flags: List[str] = field(default_factory=list)
-    confidence_score: int = 0
+class AIAnalysisResult(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     
-    # Valuation Fields
+    address_prediction: str
+    landmarks: List[str] = Field(default_factory=list)
+    neighborhood_match: str = "Unknown"
+    building_type: str = "Unknown"
+    is_panel_block: bool = False
+    heating_inventory: HeatingInventory = Field(default_factory=HeatingInventory)
     net_area_sqm: float = 0.0
     act16_due_date: Optional[str] = None
-    is_panel_block: bool = False
-    
-    def get(self, key, default=None):
-        return getattr(self, key, default)
+    visual_red_flags: List[str] = Field(default_factory=list)
+    light_exposure: Optional[str] = None
+    confidence_score: int = 0
 
-@dataclass
-class GeoVerification:
+class GeoVerification(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
     match: bool
     detected_neighborhood: str
     confidence: int
@@ -1977,26 +2004,21 @@ class GeoVerification:
     lng: Optional[float] = None
     warning: Optional[str] = None
     best_address: Optional[str] = None
-    
-    def model_dump(self):
-        return self.__dict__
 
-@dataclass
-class CadastreData:
+class CadastreData(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
     official_area: float = 0.0
     cadastre_id: Optional[str] = None
     status: Literal["LIVE", "OFFLINE", "NOT_FOUND", "ERROR"] = "NOT_FOUND"
     address_found: Optional[str] = None
-    
-    def model_dump(self):
-        return self.__dict__
 
 
 =========================================
 FILE: ./scripts/context_dump.sh
 =========================================
 #!/bin/bash
-# Scans the repo and dumps text files for LLM context
+# Optimized Scans the repo and dumps text files for LLM context
 
 output="glashaus_context.txt"
 echo "--- GLASHAUS PROJECT DUMP ---" > "$output"
@@ -2006,30 +2028,40 @@ echo -e "\n\n--- GIT HISTORY ---" >> "$output"
 git log --oneline --graph --decorate -n 20 >> "$output"
 
 echo -e "\n\n--- FILE STRUCTURE ---" >> "$output"
-# Exclude git, pycache, and compiled python files from tree view
-tree -L 3 -I '.git|__pycache__|*.pyc' >> "$output" 2>/dev/null || find . -maxdepth 3 -not -path '*/.*' >> "$output"
+# Expanded exclusion list for the tree view
+tree -L 3 -I '.git|__pycache__|*.pyc|storage|archive|*.png|*.jpg' >> "$output" 2>/dev/null
 
 echo -e "\n\n--- FILE CONTENTS ---" >> "$output"
 find . -type f \
     -not -path '*/.*' \
     -not -path '*/__pycache__*' \
+    -not -path './storage/*' \
+    -not -path './forensics/*.html' \
     -not -name '*.pyc' \
     -not -name 'cookies.txt' \
-    -not -path './glashaus_context.txt' \
-    -not -name 'bypass_audit.py' \
-    -not -name 'manual_session_audit.py' \
-    -not -path './scraper_service.py' \
+    -not -name '*.sqlite' \
     -not -name '*.png' \
     -not -name '*.jpg' \
-    -not -name '*.sqlite' \
+    -not -name 'glashaus_context.txt' \
+    -not -path './scraper_service.py' \
+    -not -path './manual_session_audit.py' \
     | while read -r file; do
+    
+    # Skip files larger than 50KB (likely raw data dumps/logs)
+    # except for the main schema or specific logic files
+    filesize=$(wc -c <"$file")
+    if [ $filesize -gt 50000 ] && [[ "$file" != *"schema"* ]]; then
+        echo -e "\n\n[SKIPPING $file - TOO LARGE: $filesize bytes]" >> "$output"
+        continue
+    fi
+
     echo -e "\n\n=========================================" >> "$output"
     echo "FILE: $file" >> "$output"
     echo "=========================================" >> "$output"
     cat "$file" >> "$output"
 done
 
-echo "Dump complete. Clean contents saved to $output"
+echo "Dump complete. Size: $(du -h $output | cut -f1)"
 
 
 =========================================
@@ -3015,6 +3047,9 @@ http {
 }
 
 
+[SKIPPING ./law.txt - TOO LARGE: 838025 bytes]
+
+
 =========================================
 FILE: ./forensics/headers.txt
 =========================================
@@ -3032,11 +3067,6 @@ report-to: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel
 cf-ray: 9b062e33d9d0d0d4-SOF
 alt-svc: h3=":443"; ma=86400
 
-
-
-=========================================
-FILE: ./forensics/page_utf8.html
-=========================================
 
 
 =========================================
@@ -3076,3 +3106,68 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
+
+
+=========================================
+FILE: ./bypass_audit.py
+=========================================
+import httpx
+from bs4 import BeautifulSoup
+import time
+import re
+
+def bypass_audit(url):
+    # Professional Browser Headers
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "bg-BG,bg;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.google.bg/",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "cross-site",
+    }
+
+    # Use a Client to maintain Cookies
+    with httpx.Client(headers=headers, follow_redirects=True, timeout=20.0) as client:
+        print("[*] STEP 1: Handshake with Home Page...")
+        home_resp = client.get("https://www.imot.bg")
+        print(f"[+] Home Page Status: {home_resp.status_code}")
+        print(f"[+] Cookies Acquired: {list(client.cookies.keys())}")
+
+        print("[*] STEP 2: Waiting (Simulating Human)...")
+        time.sleep(2.5)
+
+        print(f"[*] STEP 3: Attempting to access target: {url}")
+        # Update Referer to look like we clicked from the home page
+        client.headers.update({"Referer": "https://www.imot.bg/"})
+        
+        resp = client.get(url)
+        content = resp.content.decode('windows-1251', errors='replace')
+
+        if any(term in content.lower() for term in ["captcha", "robot", "security check"]):
+            print("!!! [FAIL] Still Blocked by WAF. They require JavaScript execution. !!!")
+            
+            # Save the failure page to see what the challenge looks like
+            with open("waf_challenge.html", "w", encoding="utf-8") as f:
+                f.write(content)
+            print("[i] Challenge page saved to waf_challenge.html. Check if it's Cloudflare or internal.")
+            return
+
+        print(f"[SUCCESS] Content Length: {len(content)} chars")
+        
+        soup = BeautifulSoup(content, 'html.parser')
+        title = soup.find('title')
+        print(f"[+] Listing Title: {title.text.strip() if title else 'N/A'}")
+
+        # Look for the price to confirm success
+        price = soup.find(id='price_obs')
+        if price:
+            print(f"[!!!] PRICE DETECTED: {price.text.strip()}")
+        else:
+            print("[?] Price tag not found. Listing might be hidden in script tags.")
+
+if __name__ == "__main__":
+    bypass_audit("https://www.imot.bg/pcgi/imot.cgi?act=5&adv=1c171899111")

@@ -11,6 +11,7 @@ from src.services.geospatial_service import GeospatialService
 from src.services.cadastre_service import CadastreService
 from src.services.forensics_service import SofiaMunicipalForensics
 from src.services.risk_engine import RiskEngine
+from src.services.legal_validator import LegalValidator
 from src.services.report_generator import AttorneyReportGenerator
 from src.core.config import settings
 from src.core.logger import logger
@@ -22,87 +23,68 @@ def audit_listing_task(listing_id: int):
 
 async def run_audit_pipeline(listing_id: int):
     log = logger.bind(listing_id=listing_id)
-    
-    async with httpx.AsyncClient(timeout=30.0) as http_client:
+    async with httpx.AsyncClient(timeout=40.0) as http_client:
         with SessionLocal() as db:
             listing = db.query(Listing).get(listing_id)
-            if not listing: return "Error: Listing not found"
+            if not listing: return
 
-            # 1. SCRAPE (Returns ScrapedListing)
-            scraper = ScraperService(client=http_client)
-            scraped_data = await scraper.scrape_url(listing.source_url)
-            
-            # 2. VISION (Returns AIAnalysisResult)
-            storage = StorageService()
-            img_paths = await storage.archive_images(listing_id, scraped_data.image_urls)
-            ai_service = GeminiService(api_key=settings.GEMINI_API_KEY)
-            ai_data = await ai_service.analyze_listing_multimodal(scraped_data.raw_text, img_paths)
-            
-            # 3. GEO TRIANGULATION (Returns GeoVerification)
-            geo_service = GeospatialService(api_key=settings.GOOGLE_MAPS_API_KEY)
-            geo_report = await geo_service.verify_neighborhood(
-                ai_data.address_prediction, 
-                ai_data.landmarks, 
-                scraped_data.neighborhood
+            # 1. Pipeline execution
+            scraped = await ScraperService(http_client).scrape_url(listing.source_url)
+            paths = await StorageService().archive_images(listing_id, scraped.image_urls)
+            ai_data = await GeminiService(settings.GEMINI_API_KEY).analyze_listing_multimodal(scraped.raw_text, paths)
+            geo = await GeospatialService(settings.GOOGLE_MAPS_API_KEY).verify_neighborhood(
+                ai_data.address_prediction, ai_data.landmarks, scraped.neighborhood
             )
             
-            # 4. REGISTRY (Returns CadastreData)
-            cadastre = CadastreService(client=http_client)
-            best_address = normalize_sofia_street(geo_report.best_address or ai_data.address_prediction)
-            cad_data = await cadastre.get_official_details(best_address)
+            # 2. Registry Logic
+            addr = normalize_sofia_street(geo.best_address or ai_data.address_prediction)
+            cad = await CadastreService(http_client).get_official_details(addr)
             
             mun_report = {"expropriation": {}, "compliance_act16": {}}
-            building_id = None
-            
-            if cad_data.cadastre_id:
-                forensics = SofiaMunicipalForensics(client=http_client)
-                mun_report = await forensics.run_full_audit(cad_data.cadastre_id)
-                
-                existing_building = db.query(Building).filter(Building.cadastre_id == cad_data.cadastre_id).first()
-                if not existing_building:
-                    new_building = Building(
-                        cadastre_id=cad_data.cadastre_id,
-                        address_full=cad_data.address_found or geo_report.best_address,
-                        latitude=geo_report.lat,
-                        longitude=geo_report.lng,
-                        construction_year=0 # AI data would go here
+            b_id = None
+            if cad.cadastre_id:
+                mun_report = await SofiaMunicipalForensics(http_client).run_full_audit(cad.cadastre_id)
+                # PERSIST Building with AI Construction Year
+                b = db.query(Building).filter(Building.cadastre_id == cad.cadastre_id).first()
+                if not b:
+                    b = Building(
+                        cadastre_id=cad.cadastre_id,
+                        address_full=cad.address_found or geo.best_address,
+                        latitude=geo.lat, longitude=geo.lng,
+                        construction_year=ai_data.construction_year_est
                     )
-                    db.add(new_building)
-                    db.flush()
-                    building_id = new_building.id
-                else:
-                    building_id = existing_building.id
+                    db.add(b); db.flush(); b_id = b.id
+                else: b_id = b.id
 
-            # 5. SCORING (Bundle Pydantic objects converted to dicts)
-            forensic_data = {
-                "scraped": scraped_data.model_dump(),
+            # 3. DETERTMINISTIC LEGAL AUDIT
+            lv = LegalValidator()
+            dwelling_check = lv.validate_dwelling_status(
+                height=ai_data.ceiling_height,
+                exposures=[ai_data.light_exposure] if ai_data.light_exposure else [],
+                has_storage=True, # Default until extracted
+                room_count=1 # Default
+            )
+            efficiency_check = lv.audit_area_efficiency(float(scraped.area_sqm), ai_data.net_area_sqm, 0)
+
+            # 4. SCORING & REPORTING
+            forensic_bundle = {
+                "scraped": scraped.model_dump(),
                 "ai": ai_data.model_dump(),
-                "geo": geo_report.model_dump(),
-                "cadastre": cad_data.model_dump(),
+                "geo": geo.model_dump(),
+                "cadastre": cad.model_dump(),
                 "compliance": mun_report.get("compliance_act16", {}),
-                "city_risk": mun_report.get("expropriation", {})
+                "city_risk": mun_report.get("expropriation", {}),
+                "legal_status": dwelling_check,
+                "area_efficiency": efficiency_check
             }
             
-            risk_engine = RiskEngine()
-            score_res = risk_engine.calculate_score_v2(forensic_data)
+            res = RiskEngine().calculate_score_v2(forensic_bundle)
+            report_text = AttorneyReportGenerator().generate_legal_brief(scraped.model_dump(), {**res, "forensics": forensic_bundle}, ai_data.model_dump())
             
-            # 6. REPORTING
-            report_gen = AttorneyReportGenerator()
-            report_text = report_gen.generate_legal_brief(
-                scraped_data.model_dump(), 
-                {**score_res, "forensics": forensic_data}, 
-                ai_data.model_dump()
-            )
-            
-            new_report = Report(
-                listing_id=listing_id,
-                building_id=building_id,
-                risk_score=score_res["score"],
-                legal_brief=report_text,
-                discrepancy_details=forensic_data,
-                status=ReportStatus.VERIFIED if score_res["score"] < 40 else ReportStatus.MANUAL_REVIEW
-            )
-            db.add(new_report)
+            db.add(Report(
+                listing_id=listing_id, building_id=b_id, risk_score=res["score"],
+                legal_brief=report_text, discrepancy_details=forensic_bundle,
+                status=ReportStatus.VERIFIED if res["score"] < 40 else ReportStatus.MANUAL_REVIEW
+            ))
             db.commit()
-            
-            return f"Audit Done: {score_res['score']}"
+            return f"Final Score: {res['score']}"
