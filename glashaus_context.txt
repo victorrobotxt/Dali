@@ -1,9 +1,11 @@
 --- GLASHAUS PROJECT DUMP ---
-Mon Dec 29 20:00:02 EET 2025
+Mon Dec 29 20:44:13 EET 2025
 
 
 --- GIT HISTORY ---
-* 9baf4be (HEAD -> main, origin/main) feat(scraper): switch to desktop protocol v2 (regex+1251)
+* 7fd0a77 (HEAD -> main, origin/main) feat(legal): implement deterministic validator engine
+* c19710d refactor(core): harden config security and dynamic db url
+* 9baf4be feat(scraper): switch to desktop protocol v2 (regex+1251)
 * 7510455 feat(forensics): patch valuation blind spots (VAT, Net Area, Ground Floor)  * VAT Normalization: Scraper now detects "No VAT" listings and automatically normalizes price (+20%) to prevent valuation asymmetry.  * Terrace Dilution: Risk Engine now calculates Net-to-Gross area efficiency; flags "Valuation Warning" if living space < 60% of total (e.g., massive terraces).  * Time-Value Risk: Added logic to extract "Act 16" due dates; penalizes liquidity risk if completion is > 1 year out.  * Ground Floor Malus: Added specific valuation penalty for "Parter" units due to security/privacy risks.  * Direct Owner Detection: Added regex to identify 0% commission listings ("Direct from owner") to prioritize high-value targets.  * Prompt Engineering: Updated Detective Prompt to explicitly extract Net Area and Construction deadlines.
 * 4ab8a35 docs: sync architecture and specs with v1.1 codebase state
 * 8a82ecf chore(maint): cleanup workspace and update project context
@@ -21,8 +23,6 @@ Mon Dec 29 20:00:02 EET 2025
 * 5a71d4d refactor(core): promote prototype to production-ready architecture
 * fdd6519 docs: update architecture, API contract, and debt log to match V1 state
 * a107438 feat(core): implement forensic analysis and anti-manipulation logic
-* 2f79d2e removed junk
-* ed4950e feat(forensics): harden backend with LexSofia logic and municipal registry strikes
 
 
 --- FILE STRUCTURE ---
@@ -69,6 +69,7 @@ Mon Dec 29 20:00:02 EET 2025
 │   │   └── routes.py
 │   ├── core
 │   │   ├── config.py
+│   │   ├── legal_constants.py
 │   │   ├── logger.py
 │   │   ├── patterns.py
 │   │   ├── sofia_data.py
@@ -88,6 +89,7 @@ Mon Dec 29 20:00:02 EET 2025
 │   │   ├── forensics_service.py
 │   │   ├── geospatial_service.py
 │   │   ├── legal_engine.py
+│   │   ├── legal_validator.py
 │   │   ├── report_generator.py
 │   │   ├── repository.py
 │   │   ├── risk_engine.py
@@ -100,7 +102,7 @@ Mon Dec 29 20:00:02 EET 2025
 └── tests
     └── test_api.py
 
-16 directories, 57 files
+16 directories, 59 files
 
 
 --- FILE CONTENTS ---
@@ -465,6 +467,7 @@ FILE: ./src/core/config.py
 =========================================
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
+from pydantic import Field
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Glashaus"
@@ -476,20 +479,30 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = "glashaus"
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
-    DATABASE_URL: str = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+    
+    # Computed at runtime if not provided (fixes f-string bug)
+    DATABASE_URL: Optional[str] = None
 
     # AI & External APIs
     GEMINI_API_KEY: str
-    GEMINI_MODEL: str = "gemini-3.0-flash"  # <--- Updated to 3.0-flash
+    GEMINI_MODEL: str = "gemini-3.0-flash"
     GOOGLE_MAPS_API_KEY: Optional[str] = None
     
     # Security
-    SECRET_KEY: str = "changethis_in_production"
+    # CRITICAL: No default value. Must be set in .env or environment.
+    SECRET_KEY: str
     
     # Infra
     REDIS_URL: str = "redis://localhost:6379/0"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # Helper to construct DB URL dynamically if missing
+    @property
+    def SYNC_DATABASE_URL(self) -> str:
+        if self.DATABASE_URL:
+            return self.DATABASE_URL
+        return f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
 
 settings = Settings()
 
@@ -613,6 +626,44 @@ class ForensicPatterns:
             flags.append("RESTRICTED_ACCESS_BROKER")
             
         return flags
+
+
+=========================================
+FILE: ./src/core/legal_constants.py
+=========================================
+from typing import List
+
+class LawOrd7:
+    """
+    Ordinance No. 7 on the Rules and Norms for the Design of Territories and Zones.
+    """
+    # Art. 72 (1) & (2) - Ceiling Heights
+    MIN_HEIGHT_LIVING_ROOM: float = 2.60  # Meters (Absolute minimum for 'Living' status)
+    MIN_HEIGHT_KITCHEN_DINING: float = 2.50
+    MIN_HEIGHT_GROUND_FLOOR: float = 3.20 # Often shops/ateliers
+
+    # Art. 78 - Exposure Rules (The "North Face" Trap)
+    # A dwelling must have at least one room with "favorable" exposure.
+    # Entirely Northern exposure is FORBIDDEN for 1-room apartments.
+    FORBIDDEN_EXPOSURES: List[str] = ["NORTH", "NORTH-EAST", "NORTH-WEST"]
+    
+    # Art. 108 - Mandatory Storage
+    REQUIRES_STORAGE: bool = True  # Basement, Attic, or Closet inside the unit is MANDATORY
+    
+    # Art. 110 - Atelier vs Dwelling
+    # Ateliers are for "individual creative activity" and do not strictly require 
+    # the favorable exposure or the 2.60m height (can be lower in parts).
+
+class LawZUT:
+    """
+    Spatial Planning Act (ZUT).
+    """
+    # Art. 169 - Accessibility & Transport
+    ELEVATOR_MANDATORY_FLOORS: int = 5 # If > 5 floors, Elevator is non-negotiable for Act 16.
+
+    # Area Calculations (Supplement to Art. 17)
+    BALCONY_AREA_WEIGHT: float = 1.00 # Balconies count 100% to Built-up Area (The Dilution Trap)
+    ATTIC_AREA_CUTOFF: float = 1.50   # Area below 1.50m height is legally 0 sq.m.
 
 
 =========================================
@@ -1490,6 +1541,107 @@ class SofiaMunicipalForensics:
 
 
 =========================================
+FILE: ./src/services/legal_validator.py
+=========================================
+from typing import Dict, List, Optional
+from src.core.legal_constants import LawOrd7, LawZUT
+from src.core.logger import logger
+
+class LegalValidator:
+    def __init__(self):
+        self.log = logger.bind(service="legal_validator")
+
+    def validate_dwelling_status(self, 
+                                 height: float, 
+                                 exposures: List[str], 
+                                 has_storage: bool, 
+                                 room_count: int) -> Dict[str, any]:
+        """
+        Determines if a property can legally be sold as a 'Dwelling' (Apartment)
+        or if it is effectively an 'Atelier' (Office/Studio).
+        """
+        flags = []
+        is_atelier = False
+        
+        # 1. Height Check (The "Low Ceiling" Trap)
+        if height > 0 and height < LawOrd7.MIN_HEIGHT_LIVING_ROOM:
+            msg = f"ILLEGAL: Ceiling height {height}m < {LawOrd7.MIN_HEIGHT_LIVING_ROOM}m. Cannot be 'Dwelling'."
+            flags.append(msg)
+            is_atelier = True
+
+        # 2. Exposure Check (The "North Face" Trap)
+        # Normalize inputs to uppercase
+        norm_exposures = [e.upper() for e in exposures]
+        
+        # If it's a 1-room unit (Studio), it cannot be entirely North
+        if room_count == 1:
+            # Check if ALL exposures are bad
+            if all(exp in LawOrd7.FORBIDDEN_EXPOSURES for exp in norm_exposures):
+                msg = f"ILLEGAL: Single-room dwelling cannot face purely {norm_exposures}. Violation of Ord.7 Art.78."
+                flags.append(msg)
+                is_atelier = True
+
+        # 3. Storage Check
+        if not has_storage:
+            msg = "NON-COMPLIANT: Missing mandatory storage (Basement/Attic/Closet). Violation of Ord.7 Art.108."
+            flags.append(msg)
+            # This alone doesn't make it an Atelier, but it makes it "Not a valid Dwelling"
+            
+        return {
+            "status": "ATELIER" if is_atelier else "DWELLING_COMPLIANT",
+            "is_trap": is_atelier,
+            "legal_flags": flags
+        }
+
+    def audit_area_efficiency(self, 
+                              advertised_sqm: float, 
+                              net_sqm: float, 
+                              balcony_sqm: float) -> Dict[str, any]:
+        """
+        Calculates the 'Real Living Density' to expose Terrace Dilution.
+        """
+        if advertised_sqm <= 0: return {}
+        
+        # ZUT Rule: Balconies are 100% of their area in the "Gross" size.
+        # We calculate the "Efficiency Ratio" = (Net - Balcony) / Advertised
+        
+        # If net_sqm is not provided or 0, we can't calculate efficiency
+        if net_sqm <= 0:
+             return {
+                "efficiency_index": 0.0,
+                "flags": ["WARN: Net area unknown. Cannot calculate efficiency."]
+             }
+
+        efficiency_index = net_sqm / advertised_sqm
+        
+        flags = []
+        # If you pay for 100m but get <60m of indoor space -> SCAM.
+        if efficiency_index < 0.60:
+            flags.append(f"VALUATION WARNING: Terrace Dilution. Efficiency {efficiency_index:.0%} < 60%.")
+            
+        return {
+            "efficiency_index": round(efficiency_index, 3),
+            "true_indoor_sqm": net_sqm,
+            "flags": flags
+        }
+
+    def check_habitability(self, floor_count: int, has_elevator: bool) -> Dict[str, any]:
+        """
+        Checks Act 16 prerequisites.
+        """
+        flags = []
+        fatal = False
+        
+        # ZUT Art. 169
+        if floor_count > LawZUT.ELEVATOR_MANDATORY_FLOORS and not has_elevator:
+            msg = f"CRITICAL: Building has {floor_count} floors but NO ELEVATOR. Act 16 impossible."
+            flags.append(msg)
+            fatal = True
+            
+        return {"act16_blockers": flags, "is_fatal": fatal}
+
+
+=========================================
 FILE: ./src/__init__.py
 =========================================
 
@@ -1545,10 +1697,10 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from src.core.config import settings
 
 # SQLite requires a specific argument for threading
-connect_args = {"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
+connect_args = {"check_same_thread": False} if "sqlite" in settings.SYNC_DATABASE_URL else {}
 
 engine = create_engine(
-    settings.DATABASE_URL, 
+    settings.SYNC_DATABASE_URL, 
     connect_args=connect_args,
     pool_pre_ping=True
 )
