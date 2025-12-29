@@ -3,10 +3,10 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from src.core.config import settings
 
 # SQLite requires a specific argument for threading
-connect_args = {"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
+connect_args = {"check_same_thread": False} if "sqlite" in settings.SYNC_DATABASE_URL else {}
 
 engine = create_engine(
-    settings.DATABASE_URL, 
+    settings.SYNC_DATABASE_URL, 
     connect_args=connect_args,
     pool_pre_ping=True
 )

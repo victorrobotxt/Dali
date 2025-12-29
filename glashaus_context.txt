@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Mon Dec 29 19:42:07 EET 2025
+Mon Dec 29 20:00:02 EET 2025
 
 
 --- GIT HISTORY ---
-* 7510455 (HEAD -> main) feat(forensics): patch valuation blind spots (VAT, Net Area, Ground Floor)  * VAT Normalization: Scraper now detects "No VAT" listings and automatically normalizes price (+20%) to prevent valuation asymmetry.  * Terrace Dilution: Risk Engine now calculates Net-to-Gross area efficiency; flags "Valuation Warning" if living space < 60% of total (e.g., massive terraces).  * Time-Value Risk: Added logic to extract "Act 16" due dates; penalizes liquidity risk if completion is > 1 year out.  * Ground Floor Malus: Added specific valuation penalty for "Parter" units due to security/privacy risks.  * Direct Owner Detection: Added regex to identify 0% commission listings ("Direct from owner") to prioritize high-value targets.  * Prompt Engineering: Updated Detective Prompt to explicitly extract Net Area and Construction deadlines.
+* 9baf4be (HEAD -> main, origin/main) feat(scraper): switch to desktop protocol v2 (regex+1251)
+* 7510455 feat(forensics): patch valuation blind spots (VAT, Net Area, Ground Floor)  * VAT Normalization: Scraper now detects "No VAT" listings and automatically normalizes price (+20%) to prevent valuation asymmetry.  * Terrace Dilution: Risk Engine now calculates Net-to-Gross area efficiency; flags "Valuation Warning" if living space < 60% of total (e.g., massive terraces).  * Time-Value Risk: Added logic to extract "Act 16" due dates; penalizes liquidity risk if completion is > 1 year out.  * Ground Floor Malus: Added specific valuation penalty for "Parter" units due to security/privacy risks.  * Direct Owner Detection: Added regex to identify 0% commission listings ("Direct from owner") to prioritize high-value targets.  * Prompt Engineering: Updated Detective Prompt to explicitly extract Net Area and Construction deadlines.
 * 4ab8a35 docs: sync architecture and specs with v1.1 codebase state
 * 8a82ecf chore(maint): cleanup workspace and update project context
 * 3f8b25f refactor(config): externalize model configuration - Move hardcoded model name to src/core/config.py - Set default model to 'gemini-3.0-flash' (Current Gen) - Update GeminiService to use settings.GEMINI_MODEL
@@ -22,7 +23,6 @@ Mon Dec 29 19:42:07 EET 2025
 * a107438 feat(core): implement forensic analysis and anti-manipulation logic
 * 2f79d2e removed junk
 * ed4950e feat(forensics): harden backend with LexSofia logic and municipal registry strikes
-* 00b1e10 feat(reporting): integrate forensic registry checks into Legal Brief generation
 
 
 --- FILE STRUCTURE ---
