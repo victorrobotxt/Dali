@@ -1,9 +1,10 @@
 --- GLASHAUS PROJECT DUMP ---
-Mon Dec 29 12:06:56 EET 2025
+Mon Dec 29 19:42:07 EET 2025
 
 
 --- GIT HISTORY ---
-* 4ab8a35 (HEAD -> main) docs: sync architecture and specs with v1.1 codebase state
+* 7510455 (HEAD -> main) feat(forensics): patch valuation blind spots (VAT, Net Area, Ground Floor)  * VAT Normalization: Scraper now detects "No VAT" listings and automatically normalizes price (+20%) to prevent valuation asymmetry.  * Terrace Dilution: Risk Engine now calculates Net-to-Gross area efficiency; flags "Valuation Warning" if living space < 60% of total (e.g., massive terraces).  * Time-Value Risk: Added logic to extract "Act 16" due dates; penalizes liquidity risk if completion is > 1 year out.  * Ground Floor Malus: Added specific valuation penalty for "Parter" units due to security/privacy risks.  * Direct Owner Detection: Added regex to identify 0% commission listings ("Direct from owner") to prioritize high-value targets.  * Prompt Engineering: Updated Detective Prompt to explicitly extract Net Area and Construction deadlines.
+* 4ab8a35 docs: sync architecture and specs with v1.1 codebase state
 * 8a82ecf chore(maint): cleanup workspace and update project context
 * 3f8b25f refactor(config): externalize model configuration - Move hardcoded model name to src/core/config.py - Set default model to 'gemini-3.0-flash' (Current Gen) - Update GeminiService to use settings.GEMINI_MODEL
 * 0201f30 feat(pipeline): integrate unified 3D municipal audit into worker task
@@ -22,7 +23,6 @@ Mon Dec 29 12:06:56 EET 2025
 * 2f79d2e removed junk
 * ed4950e feat(forensics): harden backend with LexSofia logic and municipal registry strikes
 * 00b1e10 feat(reporting): integrate forensic registry checks into Legal Brief generation
-* e3f1eaf fix(services): implement circuit breakers for government registry availability
 
 
 --- FILE STRUCTURE ---
@@ -43,6 +43,7 @@ Mon Dec 29 12:06:56 EET 2025
 ├── docs
 │   ├── ARCHITECTURE.md
 │   ├── LASTENHEFT_DE.md
+│   ├── SCRAPER_V2_PROTOCOL.md
 │   ├── TECHNICAL_DEBT.md
 │   └── api_contract.yaml
 ├── forensics
@@ -99,7 +100,7 @@ Mon Dec 29 12:06:56 EET 2025
 └── tests
     └── test_api.py
 
-16 directories, 56 files
+16 directories, 57 files
 
 
 --- FILE CONTENTS ---
@@ -344,6 +345,37 @@ FILE: ./docs/TECHNICAL_DEBT.md
 
 
 =========================================
+FILE: ./docs/SCRAPER_V2_PROTOCOL.md
+=========================================
+# Scraper Protocol V2 (Desktop/Legacy)
+
+## Problem
+The previous scraper targeted `m.imot.bg` (Mobile), which uses:
+1.  **Empty HTML Shells:** Content is loaded via JavaScript/XHR, breaking standard parsers.
+2.  **Strict WAF:** Cloudflare aggressively challenges TLS fingerprints on mobile endpoints.
+3.  **Hidden Data:** Phone numbers and broker details are obfuscated.
+
+## Solution: The "Desktop Fallback" Strategy
+We switched the scraper to target `www.imot.bg` (Desktop) with specific headers to force the **Legacy HTML** version.
+
+### Key Specs
+* **Target:** `https://www.imot.bg/pcgi/imot.cgi?act=5&adv=...`
+* **Encoding:** `windows-1251` (Critical: UTF-8 decoding causes mojibake).
+* **Parsing:** Pure **Regex** (No `BeautifulSoup` or `Pydantic` needed).
+    * *Reason:* The desktop site uses nested `<table>` structures ("Table Soup") which are hard to traverse with DOM parsers but easy to scrape with loose Regex patterns.
+
+### Extracted Fields
+* **Price:** Regex scan for `class="cena"`.
+* **Images:** Extracted from `bigPicture()` JS calls (High-Res).
+* **Phone:** Scanned from the entire body (bypasses "Show Phone" clicks).
+* **Description:** Extracted from `#description_div`.
+
+### Termux Compatibility
+* Removed `pydantic` and `playwright` dependencies.
+* Scraper is now 100% standard library + `httpx`.
+
+
+=========================================
 FILE: ./src/api/routes.py
 =========================================
 from fastapi import APIRouter, Depends, HTTPException
@@ -544,11 +576,18 @@ class ForensicPatterns:
     Centralized regex registry for text analysis.
     """
     
+    # Financial & Legal Flags
     VAT_EXCLUDED = re.compile(r"(?i)(цената е без ддс|без ддс|vat excluded|no vat|не се начислява ддс)")
     SPACE_HACK = re.compile(r"(?i)(преустроена? гарсониера|усвоен.*?балкон|кухня.*?коридор|бивша.*?кухня|маломерен|боксониера|таванско)")
     ATELIER_STATUTE = re.compile(r"(?i)(статут.*?ателие|статут на ателие|студио|творческо ателие|atelier)")
-    GROUND_FLOOR = re.compile(r"(?i)(партер|етаж 1 от|висок партер|кота 0|сутерен)")
-    FUTURE_COMPLETION = re.compile(r"(?i)(\d{1,2}%.*?сега|\d{1,2}%.*?предварителен|\d{1,2}%.*?акт 16)")
+    
+    # Valuation Flags
+    GROUND_FLOOR = re.compile(r"(?i)(партер|етаж 1 от|висок партер|кота 0|сутерен|етаж 1 жилищен)")
+    FUTURE_COMPLETION = re.compile(r"(?i)(\d{1,2}%.*?сега|\d{1,2}%.*?предварителен|\d{1,2}%.*?акт 16|въвеждане в експлоатация)")
+    
+    # Ownership Flags
+    DIRECT_OWNER = re.compile(r"(?i)(частно лице|собственик|без комисион|директно от)")
+    BROKER_EXCLUSION = re.compile(r"(?i)(само за частни|частни лица|агенции да не|без брокери|комисионна от купувача)")
 
     @classmethod
     def normalize_text(cls, text: str) -> str:
@@ -561,14 +600,17 @@ class ForensicPatterns:
         flags = []
         if not text: return flags
         
-        if cls.VAT_EXCLUDED.search(text):
-            flags.append("VAT_EXCLUDED")
+        # We don't flag VAT here because we handle it mathematically in the Scraper
         if cls.SPACE_HACK.search(text):
             flags.append("CONVERSION_RISK")
         if cls.ATELIER_STATUTE.search(text):
             flags.append("ATELIER_DETECTED")
         if cls.GROUND_FLOOR.search(text):
             flags.append("GROUND_FLOOR_RISK")
+        if cls.DIRECT_OWNER.search(text):
+            flags.append("DIRECT_OWNER_LISTING")
+        if cls.BROKER_EXCLUSION.search(text):
+            flags.append("RESTRICTED_ACCESS_BROKER")
             
         return flags
 
@@ -741,118 +783,93 @@ FILE: ./src/services/scraper_service.py
 import httpx
 import re
 import asyncio
-from decimal import Decimal, InvalidOperation
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+from decimal import Decimal
+from typing import List, Optional
 from src.schemas import ScrapedListing
 from src.core.logger import logger
-
-class WAFBlockError(Exception): pass
 
 class ScraperService:
     def __init__(self, client: httpx.AsyncClient, simulation_mode=False):
         self.client = client
-        self.simulation = simulation_mode
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile Safari/604.1",
-            "Accept-Language": "bg-BG,bg;q=0.9"
+            # Използваме Desktop User-Agent, за да получим HTML с таблици (Legacy Mode)
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Referer": "https://www.imot.bg/"
         }
 
     async def scrape_url(self, url: str) -> ScrapedListing:
-        # Standardize to mobile to reduce WAF friction
-        clean_url = url.replace("www.imot.bg", "m.imot.bg")
-        log = logger.bind(url=clean_url)
+        # 1. Конвертиране на Mobile URL към Desktop URL (ако е необходимо)
+        # Mobile: https://m.imot.bg/pcgi/imot.cgi?act=5&adv=1c176587956641453
+        # Desktop: https://www.imot.bg/pcgi/imot.cgi?act=5&adv=1c176587956641453
+        target_url = url.replace("m.imot.bg", "www.imot.bg")
+        
+        log = logger.bind(url=target_url)
         
         try:
-            # 1. Try Fast Path (HTTPX)
-            return await self._scrape_fast(clean_url, log)
+            resp = await self.client.get(target_url, headers=self.headers, follow_redirects=True)
             
-        except WAFBlockError:
-            log.warning("waf_intercept_detected", strategy="switching_to_headless_browser")
-            # 2. Fallback to Heavy Path (Playwright)
-            return await self._scrape_heavy_browser(clean_url, log)
+            # 2. Декодиране (Критично за imot.bg)
+            try:
+                content = resp.content.decode('windows-1251')
+            except UnicodeDecodeError:
+                content = resp.content.decode('utf-8', errors='ignore')
 
+            # 3. Проверка за WAF / Captcha
+            if "captcha" in content.lower() or "security check" in content.lower():
+                raise Exception("BLOCKED: Cloudflare Captcha detected")
+
+            return await asyncio.to_thread(self._parse_html, content, target_url)
+            
         except Exception as e:
-            log.error("scrape_failed_fatal", error=str(e))
+            log.error("scrape_failed", error=str(e))
             raise e
 
-    async def _scrape_fast(self, url: str, log) -> ScrapedListing:
-        resp = await self.client.get(url, headers=self.headers, follow_redirects=True)
-        content = resp.content.decode('windows-1251', errors='ignore')
-
-        if any(x in content.lower() for x in ["captcha", "security check", "verify you are human"]):
-            raise WAFBlockError("Fast scrape blocked")
-            
-        log.info("scrape_success_fast")
-        return await asyncio.to_thread(self._parse_html, content, url)
-
-    async def _scrape_heavy_browser(self, url: str, log) -> ScrapedListing:
-        """Launches a headless browser to execute JS challenges."""
-        async with async_playwright() as p:
-            browser = await p.firefox.launch(headless=True)
-            context = await browser.new_context(
-                user_agent=self.headers["User-Agent"],
-                viewport={"width": 390, "height": 844}
-            )
-            page = await context.new_page()
-            
-            try:
-                await page.goto(url, wait_until="domcontentloaded")
-                
-                # Wait for core data to appear (Max 10s)
-                try:
-                    await page.wait_for_selector('div#price, .price, .advHeader', timeout=10000)
-                except Exception:
-                    log.warning("browser_wait_timeout_proceeding_anyway")
-                
-                content = await page.content()
-                log.info("scrape_success_heavy")
-                return await asyncio.to_thread(self._parse_html, content, url)
-                
-            finally:
-                await browser.close()
-
     def _parse_html(self, content: str, url: str) -> ScrapedListing:
-        soup = BeautifulSoup(content, 'html.parser')
-        text = soup.get_text(" ", strip=True)
-
-        # 1. Price Parsing
-        p_match = re.search(r'([\d\s\.,]+)\s?(?:EUR|€|лв)', text)
-        price_decimal = Decimal("0.00")
-        if p_match:
-            try:
-                clean_str = re.sub(r'[^\d]', '', p_match.group(1))
-                price_decimal = Decimal(clean_str)
-            except (InvalidOperation, ValueError):
-                logger.warning("price_parse_failed", url=url)
-
-        # 2. Area Parsing
-        a_match = re.search(r'(\d+)\s?(?:kv|кв)', text.lower())
-        area = Decimal(a_match.group(1)) if a_match else Decimal("0.00")
+        # --- REGEX ARSENAL (Based on debug_regex_v2.py) ---
         
-        # 3. Neighborhood Extraction (Crucial for Geo-Forensics)
-        # Matches patterns like "Люлин 6, град София" or "град София, Люлин 6"
-        kv_match = re.search(r'([\w\s\d-]+),\s*град София', text)
-        if not kv_match:
-            kv_match = re.search(r'град София,\s*([\w\s\d-]+)', text)
-        
-        neighborhood = kv_match.group(1).strip() if kv_match else "Unknown"
+        # 1. Цена
+        p_match = re.search(r'class="cena">\s*([\d\s]+)', content)
+        price_decimal = Decimal(p_match.group(1).replace(" ", "")) if p_match else Decimal("0")
 
-        # 4. Image Extraction
-        images = []
-        for img in soup.find_all('img'):
-            src = img.get('src') or img.get('data-src')
-            if src and 'imot.bg' in src and 'picturess' in src:
-                if src.startswith("//"): src = "https:" + src
-                images.append(src)
+        # 2. Площ
+        a_match = re.search(r'Площ:<br/><strong>\s*(\d+)', content)
+        area = Decimal(a_match.group(1)) if a_match else Decimal("0")
+
+        # 3. Квартал (Малко по-сложен regex за извличане от заглавието или локацията)
+        # Търсим: "град Варна, Младост 1"
+        loc_match = re.search(r'Местоположение: <b>(.*?)</b>', content)
+        neighborhood = "Unknown"
+        if loc_match:
+            full_loc = loc_match.group(1)
+            if "," in full_loc:
+                neighborhood = full_loc.split(",")[-1].strip()
+            else:
+                neighborhood = full_loc
+
+        # 4. Снимки (HD)
+        # Търсим src=".../photosimotbg/..."
+        raw_imgs = re.findall(r'(?:src|data-src|data-src-gallery)=["\'](https?://[^"\']*/photosimotbg/[^"\']+)["\']', content)
+        images = list(set([i for i in raw_imgs if "nophoto" not in i]))
+
+        # 5. VAT Logic (Forensics)
+        is_vat_excluded = bool(re.search(r"(?i)(цената е без ддс|без ддс|vat excluded)", content))
+        if is_vat_excluded:
+            price_decimal = price_decimal * Decimal("1.20")
+
+        # 6. Direct Owner Logic
+        is_direct = bool(re.search(r"(?i)(частно лице|собственик|без комисион)", content))
 
         return ScrapedListing(
             source_url=url,
-            raw_text=text,
+            raw_text=content[:5000], # Пазим само началото за дебъг
             price_predicted=price_decimal,
             area_sqm=area,
             neighborhood=neighborhood,
-            image_urls=list(set(images)) # Deduplicate
+            image_urls=images,
+            is_vat_excluded=is_vat_excluded,
+            is_direct_owner=is_direct,
+            price_correction_note="VAT Adjusted" if is_vat_excluded else None
         )
 
 
@@ -860,6 +877,8 @@ class ScraperService:
 FILE: ./src/services/risk_engine.py
 =========================================
 from typing import Dict, Any
+import datetime
+from src.core.patterns import ForensicPatterns
 
 class RiskEngine:
     def calculate_score_v2(self, data: Dict) -> Dict[str, Any]:
@@ -874,6 +893,8 @@ class RiskEngine:
         risk = data.get("city_risk", {})
         geo = data.get("geo", {})
         
+        raw_text = scraped.get("raw_text", "").upper()
+        
         # 1. EXPROPRIATION (The Nuke)
         if risk.get("is_expropriated"):
             score = 100
@@ -885,34 +906,59 @@ class RiskEngine:
             score += 40
             flags.append(geo.get("warning", "Location Fraud Detected."))
 
-        # 3. CONSTRUCTION MATURITY (ACT 16 Logic)
-        # Penalize if building is modern (>2010) but no cert is found in the registry
-        est_year = ai.get("construction_year_est", 0)
-        if est_year > 2010 and not comp.get("has_act16") and comp.get("checked"):
-            score += 50
-            flags.append(f"HIGH RISK: Building estimated from {est_year}, but no Act 16 found in NAG records.")
+        # 3. CONSTRUCTION MATURITY (Time-Value Risk)
+        # Check if the promised date is far in the future
+        due_date_str = ai.get("act16_due_date")
+        if due_date_str and len(due_date_str) >= 4:
+            try:
+                # Extract year
+                due_year = int(due_date_str[:4])
+                current_year = datetime.datetime.now().year
+                if due_year > current_year + 1:
+                    score += 25
+                    flags.append(f"LIQUIDITY RISK: Act 16 promised for {due_year}. Asset is not currently habitable.")
+            except ValueError:
+                pass
 
         # 4. INFRASTRUCTURE MISMATCH (TEC/Radiator Logic)
-        raw_text = scraped.get("raw_text", "").upper()
         if "ТЕЦ" in raw_text or "ЦЕНТРАЛНО ОТОПЛЕНИЕ" in raw_text:
             inventory = ai.get("heating_inventory", {})
             if inventory.get("radiators", 0) == 0:
                 score += 15
                 flags.append("WARN: Listing claims Central Heating (TEC), but 0 radiators detected visually.")
 
-        # 5. AREA FRAUD
+        # 5. AREA FRAUD & DILUTION (The Terrace Trap)
         adv_area = float(scraped.get("area_sqm", 0))
+        net_area = float(ai.get("net_area_sqm", 0))
+        
+        # A. Check against Cadastre (Official)
         off_area = float(cad.get("official_area", 0))
         if adv_area > 0 and off_area > 0:
             diff_ratio = (adv_area - off_area) / off_area
             if diff_ratio > 0.25:
                 score += 30
                 flags.append(f"SCAM: Advertised area {adv_area}m is {diff_ratio:.1%} larger than Official {off_area}m.")
+        
+        # B. Check Net vs Gross (Terrace Dilution)
+        if adv_area > 0 and net_area > 0:
+            efficiency_ratio = net_area / adv_area
+            if efficiency_ratio < 0.60: # If living area is less than 60% of total
+                score += 20
+                flags.append(f"VALUATION WARNING: 'Terrace Dilution'. Only {efficiency_ratio:.0%} of the asset is living space ({net_area}m).")
 
         # 6. ATELIER STATUS
-        if ai.get("is_atelier"):
+        if ai.get("is_atelier") or "АТЕЛИЕ" in raw_text:
             score += 25
-            flags.append("LEGAL: Non-residential 'Atelier' status confirmed via vision analysis.")
+            flags.append("LEGAL: Non-residential 'Atelier' status confirmed.")
+
+        # 7. GROUND FLOOR PENALTY
+        if ForensicPatterns.GROUND_FLOOR.search(raw_text):
+            score += 10 # Not fatal, but decreases value
+            flags.append("VALUATION: Ground floor unit (Security/Privacy/Sewage risk).")
+            
+        # 8. VAT ADJUSTMENT NOTE
+        if scraped.get("is_vat_excluded"):
+            flags.append(f"FINANCIAL: Price adjusted +20% for VAT ({scraped.get('price_correction_note')}).")
 
         final_score = 100 if is_fatal else min(score, 100)
         return {"score": final_score, "flags": flags, "is_fatal": is_fatal}
@@ -1730,34 +1776,58 @@ async def run_audit_pipeline(listing_id: int):
 =========================================
 FILE: ./src/schemas.py
 =========================================
-from pydantic import BaseModel, Field
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import List, Optional, Literal
 
-class ScrapedListing(BaseModel):
+@dataclass
+class ScrapedListing:
     source_url: str
     raw_text: str
     price_predicted: Decimal
     area_sqm: Decimal
     neighborhood: str 
-    image_urls: List[str] = []
+    image_urls: List[str] = field(default_factory=list)
+    
+    # Forensic Fields
+    is_vat_excluded: bool = False
+    is_direct_owner: bool = False
+    price_correction_note: Optional[str] = None
+    
+    # Helper to mimic Pydantic's .model_dump()
+    def model_dump(self):
+        return {
+            k: (float(v) if isinstance(v, Decimal) else v) 
+            for k, v in self.__dict__.items()
+        }
 
-class HeatingInventory(BaseModel):
+@dataclass
+class HeatingInventory:
     ac_units: int = 0
     radiators: int = 0
     has_central_heating: bool = False
 
-class AIAnalysisResult(BaseModel):
+@dataclass
+class AIAnalysisResult:
     address_prediction: str
-    landmarks: List[str] = []
     neighborhood_match: str
     building_type: str
     heating_inventory: HeatingInventory
-    visual_red_flags: List[str] = []
     light_exposure: str
-    confidence_score: int = Field(default=0, ge=0, le=100)
+    landmarks: List[str] = field(default_factory=list)
+    visual_red_flags: List[str] = field(default_factory=list)
+    confidence_score: int = 0
+    
+    # Valuation Fields
+    net_area_sqm: float = 0.0
+    act16_due_date: Optional[str] = None
+    is_panel_block: bool = False
+    
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
-class GeoVerification(BaseModel):
+@dataclass
+class GeoVerification:
     match: bool
     detected_neighborhood: str
     confidence: int
@@ -1765,12 +1835,19 @@ class GeoVerification(BaseModel):
     lng: Optional[float] = None
     warning: Optional[str] = None
     best_address: Optional[str] = None
+    
+    def model_dump(self):
+        return self.__dict__
 
-class CadastreData(BaseModel):
+@dataclass
+class CadastreData:
     official_area: float = 0.0
     cadastre_id: Optional[str] = None
     status: Literal["LIVE", "OFFLINE", "NOT_FOUND", "ERROR"] = "NOT_FOUND"
     address_found: Optional[str] = None
+    
+    def model_dump(self):
+        return self.__dict__
 
 
 =========================================
@@ -2127,18 +2204,22 @@ run_audit(args.target, args.mode)
 FILE: ./prompts/detective_prompt_v1.md
 =========================================
 # Role: Senior Real Estate Forensic Detective (Sofia, BG)
-You are an expert in Sofia property forensics. Your goal is to cross-examine listing photos against the provided text to detect "Broker Lies" and legal risks.
+You are an expert in Sofia property forensics. Your goal is to cross-examine listing photos against the provided text to detect "Broker Lies", hidden costs, and valuation traps.
 
 ## Forensic Tasks:
-1. **Landmark Geolocation (Triangulation):** 
-   - Search backgrounds for unique Sofia landmarks (Vitosha Mountain angle, TV Tower, NDK, Paradise Mall, etc.).
+1. **Landmark Geolocation (Triangulation):** - Search backgrounds for unique Sofia landmarks (Vitosha Mountain angle, TV Tower, NDK, Paradise Mall, etc.).
    - Extract names of shops, metro stations, or street signs visible in the pixels or mentioned in text.
-2. **Object Localization (Inventory):** 
-   - Count visible AC units and heating radiators.
+
+2. **Object Localization (Inventory):** - Count visible AC units and heating radiators.
    - Look for the 'TEC' (Central Heating) nodes or gas boilers.
-3. **Architectural Era Analysis:** Identify if the building is Pre-1989 (Panel/EPC) or Post-2000 (Brick) based on facade style and materials.
-4. **The Atelier Trap:** Identify "shop-style" glass, ground-floor placements, or lack of balconies which suggest non-residential status.
-5. **Orientation Check:** Compare the light levels. If "Sunny South" is claimed but shadows suggest North, flag it.
+
+3. **Architectural Era Analysis:** - Identify if the building is Pre-1989 (Panel/EPC) or Post-2000 (Brick) based on facade style and materials.
+
+4. **The Atelier Trap:** - Identify "shop-style" glass, ground-floor placements, or lack of balconies which suggest non-residential status.
+
+5. **Valuation Traps (CRITICAL):**
+   - **Net Area:** Extract the "Clean Living Area" (Чиста площ / Zastroena plosht) separate from common parts/terraces. If not explicitly stated, estimate it.
+   - **Time Value:** Extract the promised "Act 16" or "Permission for use" date (e.g., "April 2026").
 
 ## Output Format (JSON Only):
 {
@@ -2146,11 +2227,14 @@ You are an expert in Sofia property forensics. Your goal is to cross-examine lis
   "landmarks": ["Name of shop/landmark found"],
   "neighborhood_match": "Confident/Suspicious/Inconsistent",
   "building_type": "Panel / Brick / EPC / New Construction",
+  "is_panel_block": boolean,
   "heating_inventory": {
     "ac_units": 0,
     "radiators": 0,
     "has_central_heating": boolean
   },
+  "net_area_sqm": float (0 if unknown),
+  "act16_due_date": "YYYY-MM or 'Ready'",
   "visual_red_flags": ["List specific discrepancies"],
   "light_exposure": "North/South/East/West",
   "confidence_score": 0-100

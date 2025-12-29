@@ -1,123 +1,91 @@
 import httpx
 import re
 import asyncio
-from decimal import Decimal, InvalidOperation
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+from decimal import Decimal
+from typing import List, Optional
 from src.schemas import ScrapedListing
 from src.core.logger import logger
-from src.core.patterns import ForensicPatterns
-
-class WAFBlockError(Exception): pass
 
 class ScraperService:
     def __init__(self, client: httpx.AsyncClient, simulation_mode=False):
         self.client = client
-        self.simulation = simulation_mode
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile Safari/604.1",
-            "Accept-Language": "bg-BG,bg;q=0.9"
+            # Използваме Desktop User-Agent, за да получим HTML с таблици (Legacy Mode)
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Referer": "https://www.imot.bg/"
         }
 
     async def scrape_url(self, url: str) -> ScrapedListing:
-        clean_url = url.replace("www.imot.bg", "m.imot.bg")
-        log = logger.bind(url=clean_url)
+        # 1. Конвертиране на Mobile URL към Desktop URL (ако е необходимо)
+        # Mobile: https://m.imot.bg/pcgi/imot.cgi?act=5&adv=1c176587956641453
+        # Desktop: https://www.imot.bg/pcgi/imot.cgi?act=5&adv=1c176587956641453
+        target_url = url.replace("m.imot.bg", "www.imot.bg")
+        
+        log = logger.bind(url=target_url)
         
         try:
-            return await self._scrape_fast(clean_url, log)
-        except WAFBlockError:
-            log.warning("waf_intercept_detected", strategy="switching_to_headless_browser")
-            return await self._scrape_heavy_browser(clean_url, log)
+            resp = await self.client.get(target_url, headers=self.headers, follow_redirects=True)
+            
+            # 2. Декодиране (Критично за imot.bg)
+            try:
+                content = resp.content.decode('windows-1251')
+            except UnicodeDecodeError:
+                content = resp.content.decode('utf-8', errors='ignore')
+
+            # 3. Проверка за WAF / Captcha
+            if "captcha" in content.lower() or "security check" in content.lower():
+                raise Exception("BLOCKED: Cloudflare Captcha detected")
+
+            return await asyncio.to_thread(self._parse_html, content, target_url)
+            
         except Exception as e:
-            log.error("scrape_failed_fatal", error=str(e))
+            log.error("scrape_failed", error=str(e))
             raise e
 
-    async def _scrape_fast(self, url: str, log) -> ScrapedListing:
-        resp = await self.client.get(url, headers=self.headers, follow_redirects=True)
-        content = resp.content.decode('windows-1251', errors='ignore')
-
-        if any(x in content.lower() for x in ["captcha", "security check", "verify you are human"]):
-            raise WAFBlockError("Fast scrape blocked")
-            
-        log.info("scrape_success_fast")
-        return await asyncio.to_thread(self._parse_html, content, url)
-
-    async def _scrape_heavy_browser(self, url: str, log) -> ScrapedListing:
-        async with async_playwright() as p:
-            browser = await p.firefox.launch(headless=True)
-            context = await browser.new_context(
-                user_agent=self.headers["User-Agent"],
-                viewport={"width": 390, "height": 844}
-            )
-            page = await context.new_page()
-            
-            try:
-                await page.goto(url, wait_until="domcontentloaded")
-                try:
-                    await page.wait_for_selector('div#price, .price, .advHeader', timeout=10000)
-                except Exception:
-                    log.warning("browser_wait_timeout_proceeding_anyway")
-                
-                content = await page.content()
-                log.info("scrape_success_heavy")
-                return await asyncio.to_thread(self._parse_html, content, url)
-            finally:
-                await browser.close()
-
     def _parse_html(self, content: str, url: str) -> ScrapedListing:
-        soup = BeautifulSoup(content, 'html.parser')
-        text = soup.get_text(" ", strip=True)
+        # --- REGEX ARSENAL (Based on debug_regex_v2.py) ---
         
-        # --- 1. Price Parsing & VAT Logic ---
-        p_match = re.search(r'([\d\s\.,]+)\s?(?:EUR|€|лв)', text)
-        price_decimal = Decimal("0.00")
-        is_vat_excluded = False
-        correction_note = None
+        # 1. Цена
+        p_match = re.search(r'class="cena">\s*([\d\s]+)', content)
+        price_decimal = Decimal(p_match.group(1).replace(" ", "")) if p_match else Decimal("0")
 
-        if p_match:
-            try:
-                clean_str = re.sub(r'[^\d]', '', p_match.group(1))
-                price_decimal = Decimal(clean_str)
-                
-                # FORENSIC CHECK: VAT
-                if ForensicPatterns.VAT_EXCLUDED.search(text):
-                    is_vat_excluded = True
-                    original = price_decimal
-                    price_decimal = price_decimal * Decimal("1.20") # Add 20%
-                    correction_note = f"Auto-adjusted +20% VAT (Was {original})"
-                    
-            except (InvalidOperation, ValueError):
-                logger.warning("price_parse_failed", url=url)
+        # 2. Площ
+        a_match = re.search(r'Площ:<br/><strong>\s*(\d+)', content)
+        area = Decimal(a_match.group(1)) if a_match else Decimal("0")
 
-        # --- 2. Area Parsing ---
-        a_match = re.search(r'(\d+)\s?(?:kv|кв)', text.lower())
-        area = Decimal(a_match.group(1)) if a_match else Decimal("0.00")
-        
-        # --- 3. Neighborhood Extraction ---
-        kv_match = re.search(r'([\w\s\d-]+),\s*град София', text)
-        if not kv_match:
-            kv_match = re.search(r'град София,\s*([\w\s\d-]+)', text)
-        neighborhood = kv_match.group(1).strip() if kv_match else "Unknown"
+        # 3. Квартал (Малко по-сложен regex за извличане от заглавието или локацията)
+        # Търсим: "град Варна, Младост 1"
+        loc_match = re.search(r'Местоположение: <b>(.*?)</b>', content)
+        neighborhood = "Unknown"
+        if loc_match:
+            full_loc = loc_match.group(1)
+            if "," in full_loc:
+                neighborhood = full_loc.split(",")[-1].strip()
+            else:
+                neighborhood = full_loc
 
-        # --- 4. Image Extraction ---
-        images = []
-        for img in soup.find_all('img'):
-            src = img.get('src') or img.get('data-src')
-            if src and 'imot.bg' in src and 'picturess' in src:
-                if src.startswith("//"): src = "https:" + src
-                images.append(src)
-                
-        # --- 5. Ownership Logic ---
-        is_direct = bool(ForensicPatterns.DIRECT_OWNER.search(text))
+        # 4. Снимки (HD)
+        # Търсим src=".../photosimotbg/..."
+        raw_imgs = re.findall(r'(?:src|data-src|data-src-gallery)=["\'](https?://[^"\']*/photosimotbg/[^"\']+)["\']', content)
+        images = list(set([i for i in raw_imgs if "nophoto" not in i]))
+
+        # 5. VAT Logic (Forensics)
+        is_vat_excluded = bool(re.search(r"(?i)(цената е без ддс|без ддс|vat excluded)", content))
+        if is_vat_excluded:
+            price_decimal = price_decimal * Decimal("1.20")
+
+        # 6. Direct Owner Logic
+        is_direct = bool(re.search(r"(?i)(частно лице|собственик|без комисион)", content))
 
         return ScrapedListing(
             source_url=url,
-            raw_text=text,
+            raw_text=content[:5000], # Пазим само началото за дебъг
             price_predicted=price_decimal,
             area_sqm=area,
             neighborhood=neighborhood,
-            image_urls=list(set(images)),
+            image_urls=images,
             is_vat_excluded=is_vat_excluded,
             is_direct_owner=is_direct,
-            price_correction_note=correction_note
+            price_correction_note="VAT Adjusted" if is_vat_excluded else None
         )
