@@ -1,55 +1,43 @@
-from dataclasses import dataclass, field
+from pydantic import BaseModel, Field, ConfigDict
 from decimal import Decimal
 from typing import List, Optional, Literal
 
-@dataclass
-class ScrapedListing:
+class ScrapedListing(BaseModel):
+    model_config = ConfigDict(from_attributes=True, arbitrary_types_allowed=True)
+    
     source_url: str
     raw_text: str
     price_predicted: Decimal
     area_sqm: Decimal
     neighborhood: str 
-    image_urls: List[str] = field(default_factory=list)
-    
-    # Forensic Fields
+    image_urls: List[str] = Field(default_factory=list)
     is_vat_excluded: bool = False
     is_direct_owner: bool = False
     price_correction_note: Optional[str] = None
-    
-    # Helper to mimic Pydantic's .model_dump()
-    def model_dump(self):
-        return {
-            k: (float(v) if isinstance(v, Decimal) else v) 
-            for k, v in self.__dict__.items()
-        }
 
-@dataclass
-class HeatingInventory:
+class HeatingInventory(BaseModel):
     ac_units: int = 0
     radiators: int = 0
     has_central_heating: bool = False
 
-@dataclass
-class AIAnalysisResult:
-    address_prediction: str
-    neighborhood_match: str
-    building_type: str
-    heating_inventory: HeatingInventory
-    light_exposure: str
-    landmarks: List[str] = field(default_factory=list)
-    visual_red_flags: List[str] = field(default_factory=list)
-    confidence_score: int = 0
+class AIAnalysisResult(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     
-    # Valuation Fields
+    address_prediction: str
+    landmarks: List[str] = Field(default_factory=list)
+    neighborhood_match: str = "Unknown"
+    building_type: str = "Unknown"
+    is_panel_block: bool = False
+    heating_inventory: HeatingInventory = Field(default_factory=HeatingInventory)
     net_area_sqm: float = 0.0
     act16_due_date: Optional[str] = None
-    is_panel_block: bool = False
-    
-    def get(self, key, default=None):
-        return getattr(self, key, default)
+    visual_red_flags: List[str] = Field(default_factory=list)
+    light_exposure: Optional[str] = None
+    confidence_score: int = 0
 
-@dataclass
-class GeoVerification:
+class GeoVerification(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
     match: bool
     detected_neighborhood: str
     confidence: int
@@ -57,16 +45,11 @@ class GeoVerification:
     lng: Optional[float] = None
     warning: Optional[str] = None
     best_address: Optional[str] = None
-    
-    def model_dump(self):
-        return self.__dict__
 
-@dataclass
-class CadastreData:
+class CadastreData(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
     official_area: float = 0.0
     cadastre_id: Optional[str] = None
     status: Literal["LIVE", "OFFLINE", "NOT_FOUND", "ERROR"] = "NOT_FOUND"
     address_found: Optional[str] = None
-    
-    def model_dump(self):
-        return self.__dict__

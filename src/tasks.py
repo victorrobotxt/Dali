@@ -28,39 +28,36 @@ async def run_audit_pipeline(listing_id: int):
             listing = db.query(Listing).get(listing_id)
             if not listing: return "Error: Listing not found"
 
-            # 1. SCRAPE
+            # 1. SCRAPE (Returns ScrapedListing)
             scraper = ScraperService(client=http_client)
             scraped_data = await scraper.scrape_url(listing.source_url)
             
-            # 2. VISION
+            # 2. VISION (Returns AIAnalysisResult)
             storage = StorageService()
             img_paths = await storage.archive_images(listing_id, scraped_data.image_urls)
             ai_service = GeminiService(api_key=settings.GEMINI_API_KEY)
             ai_data = await ai_service.analyze_listing_multimodal(scraped_data.raw_text, img_paths)
             
-            # 3. GEO TRIANGULATION
+            # 3. GEO TRIANGULATION (Returns GeoVerification)
             geo_service = GeospatialService(api_key=settings.GOOGLE_MAPS_API_KEY)
             geo_report = await geo_service.verify_neighborhood(
-                ai_data.get("address_prediction"), 
-                ai_data.get("landmarks", []), 
+                ai_data.address_prediction, 
+                ai_data.landmarks, 
                 scraped_data.neighborhood
             )
             
-            # 4. REGISTRY (LINEAR)
+            # 4. REGISTRY (Returns CadastreData)
             cadastre = CadastreService(client=http_client)
-            best_address = normalize_sofia_street(geo_report.best_address or ai_data.get("address_prediction"))
+            best_address = normalize_sofia_street(geo_report.best_address or ai_data.address_prediction)
             cad_data = await cadastre.get_official_details(best_address)
             
-            # NEW: UNIFIED MUNICIPAL AUDIT
             mun_report = {"expropriation": {}, "compliance_act16": {}}
             building_id = None
             
             if cad_data.cadastre_id:
-                # Parallel Municipal Strike
                 forensics = SofiaMunicipalForensics(client=http_client)
                 mun_report = await forensics.run_full_audit(cad_data.cadastre_id)
                 
-                # Persist Building Context
                 existing_building = db.query(Building).filter(Building.cadastre_id == cad_data.cadastre_id).first()
                 if not existing_building:
                     new_building = Building(
@@ -68,7 +65,7 @@ async def run_audit_pipeline(listing_id: int):
                         address_full=cad_data.address_found or geo_report.best_address,
                         latitude=geo_report.lat,
                         longitude=geo_report.lng,
-                        construction_year=ai_data.get("construction_year_est")
+                        construction_year=0 # AI data would go here
                     )
                     db.add(new_building)
                     db.flush()
@@ -76,22 +73,26 @@ async def run_audit_pipeline(listing_id: int):
                 else:
                     building_id = existing_building.id
 
-            # 5. SCORING
+            # 5. SCORING (Bundle Pydantic objects converted to dicts)
             forensic_data = {
                 "scraped": scraped_data.model_dump(),
-                "ai": ai_data,
+                "ai": ai_data.model_dump(),
                 "geo": geo_report.model_dump(),
                 "cadastre": cad_data.model_dump(),
-                # Map new service output to Risk Engine expected keys
                 "compliance": mun_report.get("compliance_act16", {}),
                 "city_risk": mun_report.get("expropriation", {})
             }
+            
             risk_engine = RiskEngine()
             score_res = risk_engine.calculate_score_v2(forensic_data)
             
             # 6. REPORTING
             report_gen = AttorneyReportGenerator()
-            report_text = report_gen.generate_legal_brief(scraped_data.model_dump(), {**score_res, "forensics": forensic_data}, ai_data)
+            report_text = report_gen.generate_legal_brief(
+                scraped_data.model_dump(), 
+                {**score_res, "forensics": forensic_data}, 
+                ai_data.model_dump()
+            )
             
             new_report = Report(
                 listing_id=listing_id,
