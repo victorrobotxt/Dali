@@ -24,7 +24,12 @@ async def initiate_audit(request: AuditRequest, db: Session = Depends(get_db)):
     """
     repo = RealEstateRepository(db)
     # Create listing immediately to return ID
-    listing = repo.create_listing(url=request.url, price=request.price_override, area=0.0, desc="Queued")
+    listing = repo.create_listing_initial(url=request.url)
+    
+    # Apply override if provided
+    if request.price_override > 0:
+        listing.price_bgn = request.price_override
+        db.commit()
     
     # Offload to Redis/Celery
     audit_listing_task.delay(listing.id)
@@ -40,7 +45,7 @@ def get_report(listing_id: int, db: Session = Depends(get_db)):
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
         
-    report = db.query(Report).filter(Report.listing_id == listing_id).first()
+    report = db.query(Report).filter(Report.listing_id == listing_id).order_by(Report.created_at.desc()).first()
     if not report:
         # If no report exists yet, the worker is likely still processing
         return {"status": "PROCESSING", "details": "Audit is currently in the queue."}

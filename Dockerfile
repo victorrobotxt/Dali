@@ -34,6 +34,8 @@ ENV PATH=/home/glashaus_user/.local/bin:$PATH
 # Copy App Code with correct ownership
 COPY --chown=glashaus_user:glashaus_user . .
 
+RUN mkdir -p storage/archive && chown -R glashaus_user:glashaus_user /app
+
 USER glashaus_user
 
 EXPOSE 8000

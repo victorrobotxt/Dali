@@ -14,15 +14,41 @@ class GeminiService:
         self.model_name = settings.GEMINI_MODEL
 
     async def analyze_listing_multimodal(self, text_content: str, image_paths: List[str]) -> AIAnalysisResult:
-        log = logger.bind(model=self.model_name)
-        log.info("starting_multimodal_analysis", image_count=len(image_paths))
+        # --- OPTIMIZATION: Limit to 3 images max ---
+        selected_images = image_paths[:3]
         
-        prompt = f"Analyze this listing text and images. Return JSON ONLY matching our forensic schema.\nTEXT:\n{text_content}"
+        log = logger.bind(model=self.model_name)
+        log.info("starting_multimodal_analysis", image_count=len(selected_images), total_found=len(image_paths))
+        
+        # --- FIX: Define the schema explicitly in the prompt ---
+        # This prevents Gemini from wrapping the result in random keys like 'listing_data'
+        schema_def = """
+        {
+          "address_prediction": "str",
+          "landmarks": ["str"],
+          "neighborhood_match": "Confident/Suspicious/Inconsistent",
+          "building_type": "str",
+          "is_panel_block": bool,
+          "construction_year_est": int,
+          "room_count": int,
+          "ceiling_height": float,
+          "has_storage": bool,
+          "heating_inventory": {
+            "ac_units": int, "radiators": int, "has_central_heating": bool
+          },
+          "net_area_sqm": float,
+          "act16_due_date": "YYYY-MM or 'Ready'",
+          "visual_red_flags": ["str"],
+          "light_exposure": "str"
+        }
+        """
+        
+        prompt = f"Analyze this listing. Return valid JSON ONLY matching this exact schema:\n{schema_def}\n\nTEXT DATA:\n{text_content}"
         
         uploaded_files = []
         try:
             # 1. Upload files using the new Client
-            for path in image_paths:
+            for path in selected_images:
                 # Wrap sync call in asyncio.to_thread to keep app async
                 file_ref = await asyncio.to_thread(
                     self.client.files.upload, 
@@ -30,7 +56,7 @@ class GeminiService:
                 )
                 uploaded_files.append(file_ref)
 
-            # 2. Prepare content and configuration
+            # 2. Configure for JSON
             # We explicitly tell Gemini to return JSON
             config = types.GenerateContentConfig(
                 response_mime_type="application/json"
@@ -47,13 +73,13 @@ class GeminiService:
                 config=config
             )
             
-            # 4. Cleanup remote files
+            # 4. Cleanup remote files immediately
+            # (Crucial to avoid hitting storage quotas on Google's side)
             for f in uploaded_files:
                 await asyncio.to_thread(self.client.files.delete, name=f.name)
 
             # 5. Parse JSON
-            # Since we requested MIME type application/json, we don't need manual stripping
-            # response.text should be clean JSON.
+            # Since we requested MIME type application/json, response.text is clean JSON
             data = json.loads(response.text)
             
             # STRICT VALIDATION via Pydantic
@@ -61,6 +87,6 @@ class GeminiService:
             
         except Exception as e:
             log.error("ai_analysis_failed", error=str(e))
-            # Fallback to empty validated object
+            # Fallback to empty validated object to prevent pipeline crash
             return AIAnalysisResult(address_prediction="Unknown", landmarks=[])
         
