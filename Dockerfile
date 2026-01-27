@@ -14,20 +14,26 @@ FROM python:3.11-slim as runtime
 
 WORKDIR /app
 
-# Install only runtime libs (libpq for Postgres)
+# Install runtime libs
 RUN apt-get update && apt-get install -y \
     libpq5 netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed packages from builder
-COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
-
-# Copy Application Code
-COPY . .
-
-# Create a non-root user for security
+# Create user FIRST
 RUN useradd -m glashaus_user
+
+# Copy dependencies to the USER'S home, not root's
+COPY --from=builder /root/.local /home/glashaus_user/.local
+
+# Ensure the user owns their own dependencies
+RUN chown -R glashaus_user:glashaus_user /home/glashaus_user/.local
+
+# Update PATH to point to the user's local bin
+ENV PATH=/home/glashaus_user/.local/bin:$PATH
+
+# Copy App Code with correct ownership
+COPY --chown=glashaus_user:glashaus_user . .
+
 USER glashaus_user
 
 EXPOSE 8000
