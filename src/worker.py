@@ -14,6 +14,8 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="Europe/Sofia",
     enable_utc=True,
+    # Fixes the warning about connection retries during startup
+    broker_connection_retry_on_startup=True,
 )
 
 # Auto-discover tasks in src/tasks.py
