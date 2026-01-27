@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+@plugin "tailwindcss-animate";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  /* Cyber-Noir Color Palette */
+  --color-background: #050505;
+  --color-foreground: #E5E5E5;
+  --color-tech-blue: #00F0FF;
+  --color-tech-amber: #FFB000;
+  
+  /* Mapping Shadcn Variables */
+  --color-border: #222222;
+  --color-input: #18181b;
+  --color-ring: #00F0FF;
+  
+  --font-mono: "JetBrains Mono", monospace;
+}
+
+@layer base {
+  body {
+    @apply bg-background text-foreground font-mono antialiased;
+  }
+}
+
+@layer utilities {
+  .grid-bg {
+    background-image: 
+        linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+    background-size: 30px 30px;
+  }
+
+  .scanline {
+    position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+    background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,0) 50%, rgba(0,0,0,0.2) 50%, rgba(0,0,0,0.2));
+    background-size: 100% 4px; pointer-events: none; z-index: 50; opacity: 0.3;
+  }
+
+  .cursor-blink {
+    animation: blink 1s step-end infinite;
+    display: inline-block; vertical-align: text-bottom; width: 8px; height: 1.2em; background-color: #00F0FF;
+  }
+}
+
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
