@@ -1,4 +1,4 @@
-[cite_start]// Auto-generated mirror of src/schemas.py [cite: 143, 145]
+// glashaus-web/src/types/api.ts
 
 export type ReportStatus = 'PENDING' | 'PROCESSING' | 'VERIFIED' | 'MANUAL_REVIEW' | 'REJECTED';
 
@@ -21,6 +21,9 @@ export interface AIAnalysisResult {
   construction_year_est: number;
   room_count: number;
   ceiling_height: number;
+  has_storage: boolean; // <--- FIXED: Added this
+  light_exposure?: string; // <--- Added for completeness
+  act16_due_date?: string; // <--- Added for completeness
   heating_inventory: {
     ac_units: number;
     radiators: number;
@@ -58,6 +61,12 @@ export interface ForensicReport {
       status: string;
       is_trap: boolean;
       legal_flags: string[];
+    };
+    city_risk?: {
+        is_expropriated: boolean;
+    };
+    compliance?: {
+        has_act16: boolean;
     };
   };
   manual_notes?: string;

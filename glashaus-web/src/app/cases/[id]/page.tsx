@@ -11,6 +11,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from '@/components/ui/badge';
 import type { ForensicReport } from '@/types/api';
 import { ShieldCheck, ShieldAlert, Activity, Building, Microscope, Scale } from 'lucide-react';
+import { CadastreTable } from './_components/CadastreTable';
 
 export default function WarRoom() {
   const { id } = useParams();
@@ -89,7 +90,7 @@ export default function WarRoom() {
               <div className="absolute bottom-0 left-0 w-full bg-gradient-to-t from-black/90 to-transparent p-3 pt-8">
                 <div className="flex justify-between items-end">
                   <div className="text-xl font-mono font-bold text-white">
-                    {scraped?.price_predicted?.toLocaleString() || 0} <span className="text-sm text-zinc-500">BGN</span>
+                    {scraped?.price_predicted?.toLocaleString() || 0} <span className="text-sm text-zinc-500">EUR</span>
                   </div>
                   <div className="text-right text-xs font-mono text-zinc-400">
                     {scraped?.area_sqm} m²
@@ -190,51 +191,13 @@ export default function WarRoom() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                {/* 1. Area Check */}
-                <div className="p-3 border border-zinc-800 bg-zinc-950/50 rounded">
-                   <div className="text-[10px] text-zinc-500 mb-1">AREA INTEGRITY</div>
-                   <div className="flex justify-between items-end">
-                      <span className="text-lg font-mono">{cad?.official_area || 0} m²</span>
-                      <Badge variant="outline" className={cn("text-[9px]", 
-                         Math.abs((cad?.official_area || 0) - (scraped?.area_sqm || 0)) > 5 ? "text-red-500 border-red-900" : "text-emerald-500 border-emerald-900"
-                      )}>
-                         {Math.abs((cad?.official_area || 0) - (scraped?.area_sqm || 0)).toFixed(1)} m² DIFF
-                      </Badge>
-                   </div>
-                </div>
-
-                {/* 2. Legal Status */}
-                <div className="p-3 border border-zinc-800 bg-zinc-950/50 rounded">
-                   <div className="text-[10px] text-zinc-500 mb-1">LEGAL STATUS</div>
-                   <div className="flex justify-between items-end">
-                      <span className="text-sm font-mono font-bold text-zinc-200">
-                         {legal?.status || "PENDING"}
-                      </span>
-                      {legal?.is_trap && (
-                         <ShieldAlert className="w-4 h-4 text-red-500 animate-pulse" />
-                      )}
-                   </div>
-                   <div className="text-[9px] text-zinc-600 mt-1 truncate">
-                      {legal?.legal_flags?.[0] || "No critical flags found."}
-                   </div>
-                </div>
-
-                 {/* 3. Social Risk */}
-                 <div className="p-3 border border-zinc-800 bg-zinc-950/50 rounded">
-                   <div className="text-[10px] text-zinc-500 mb-1">MUNICIPAL RISK</div>
-                   <div className="flex justify-between items-end">
-                      <span className="text-lg font-mono">{(cad?.social_risk_ratio || 0) * 100}%</span>
-                      <span className="text-[9px] text-zinc-600">OWNED BY CITY</span>
-                   </div>
-                   <div className="w-full bg-zinc-800 h-1 mt-2 rounded-full overflow-hidden">
-                      <div 
-                        className="bg-red-500 h-full transition-all" 
-                        style={{ width: `${(cad?.social_risk_ratio || 0) * 100}%` }} 
-                      />
-                   </div>
-                </div>
-             </div>
+             <CadastreTable 
+                scrapedArea={scraped?.area_sqm || 0}
+                officialArea={cad?.official_area || 0}
+                cadastreId={cad?.cadastre_id || ""}
+                isExpropriated={report.discrepancies?.city_risk?.is_expropriated || false}
+                hasAct16={report.discrepancies?.compliance?.has_act16 || false}
+             />
           </CardContent>
         </Card>
 

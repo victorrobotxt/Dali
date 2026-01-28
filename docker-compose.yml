@@ -1,49 +1,92 @@
 services:
-  # 1. GATEWAY (Entry Point)
+  # -------------------------------------------------------
+  # 1. GATEWAY (Nginx Reverse Proxy)
+  # Maps localhost:8080 -> Internal Services
+  # -------------------------------------------------------
   nginx:
     image: nginx:alpine
+    container_name: dali-nginx-1
     ports:
       - "8080:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro,Z
     depends_on:
       - api
+      - web
 
-  # 2. API (Internal)
+  # -------------------------------------------------------
+  # 2. FRONTEND (The War Room Dashboard)
+  # -------------------------------------------------------
+  web:
+    build:
+      context: ./glashaus-web
+      dockerfile: Dockerfile
+    container_name: dali-web-1
+    # Hot-reload volume mount for local development (Optional)
+    # Remove this block if you want to run the optimized production build defined in Dockerfile
+    # volumes:
+    #    - ./glashaus-web:/app
+    #    - /app/node_modules
+    # command: npm run dev # Use 'dev' for coding, remove this line for Prod
+    ports:
+      - "3000:3000"
+    environment:
+      # Browser talks to Nginx (publicly exposed on 8080)
+      - NEXT_PUBLIC_API_URL=http://localhost:8080
+      # Next.js Server (SSR) talks to Python API via internal Docker network
+      - API_INTERNAL_URL=http://api:8000
+    depends_on:
+      - api
+
+  # -------------------------------------------------------
+  # 3. API (FastAPI Backend)
+  # -------------------------------------------------------
   api:
     build: .
+    container_name: dali-api-1
     ports:
-      - "8000:8000"  # <--- Change this from 'expose' to 'ports'
+      - "8000:8000"
     env_file: .env
     environment:
       - POSTGRES_HOST=db
+      - REDIS_URL=redis://redis:6379/0
     depends_on:
       - db
       - redis
 
-  # 3. WORKER
+  # -------------------------------------------------------
+  # 4. WORKER (Celery + Gemini + Scraper)
+  # -------------------------------------------------------
   worker:
     build: .
+    container_name: dali-worker-1
     command: celery -A src.worker.celery_app worker --loglevel=info
-    env_file: .env                 # <--- LOADS SECRETS FROM .env FILE
+    env_file: .env
     environment:
-      - POSTGRES_HOST=db           # <--- FIXED
+      - POSTGRES_HOST=db
+      - REDIS_URL=redis://redis:6379/0
     depends_on:
       - db
       - redis
 
-  # 4. REDIS
+  # -------------------------------------------------------
+  # 5. REDIS (Task Queue Broker)
+  # -------------------------------------------------------
   redis:
     image: redis:7-alpine
+    container_name: dali-redis-1
     ports:
       - "6379:6379"
 
-  # 5. DB
+  # -------------------------------------------------------
+  # 6. DATABASE (PostgreSQL + PostGIS)
+  # -------------------------------------------------------
   db:
     image: postgis/postgis:15-3.4
+    container_name: dali-db-1
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    env_file: .env                 # <--- LOADS DB CREDENTIALS
+    env_file: .env
     ports:
       - "5432:5432"
 
