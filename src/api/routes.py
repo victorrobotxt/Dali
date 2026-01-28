@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
+import httpx
 from sqlalchemy.orm import Session
 from src.db.session import get_db
 from src.db.models import Listing, Report, ReportStatus
 from src.services.repository import RealEstateRepository
+from src.services.scraper_service import ScraperService
 from src.tasks import audit_listing_task
 from pydantic import BaseModel
 from typing import Optional
@@ -83,3 +85,22 @@ def update_report_status(report_id: int, update: ReportUpdate, db: Session = Dep
         
     db.commit()
     return {"id": report.id, "new_status": report.status}
+
+
+@router.post("/debug/scrape")
+async def debug_scrape(request: AuditRequest):
+    """
+    Directly invokes ScraperService to test parsing logic.
+    Bypasses DB and Celery. Returns raw extracted data.
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        service = ScraperService(client)
+        try:
+            # We use the URL from the request body
+            result = await service.scrape_url(request.url)
+            return {
+                "status": "SUCCESS",
+                "data": result.model_dump()
+            }
+        except Exception as e:
+            return {"status": "ERROR", "details": str(e)}
