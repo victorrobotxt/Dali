@@ -5,28 +5,35 @@ output="glashaus_context.txt"
 echo "--- GLASHAUS PROJECT DUMP ---" > "$output"
 date >> "$output"
 
+# Define directories to completely ignore (folders)
+IGNORE_DIRS="(node_modules|.next|.git|__pycache__|storage|logs|archive|.venv|venv|dist|build)"
+
+# Define specific file names/extensions to ignore
+IGNORE_FILES="(*.pyc|*.png|*.ico|*.jpg|*.svg|*.sqlite|*.lock|package-lock.json|bun.lockb|yarn.lock|.DS_Store)"
+
 echo -e "\n\n--- GIT HISTORY ---" >> "$output"
 git log --oneline --graph --decorate -n 20 >> "$output"
 
 echo -e "\n\n--- FILE STRUCTURE ---" >> "$output"
-# Expanded exclusion list for the tree view
-tree -L 3 -I '.git|__pycache__|*.pyc|storage|archive|*.png|*.jpg' >> "$output" 2>/dev/null
+# Uses the ignore pattern for tree
+tree -L 3 -I "$IGNORE_DIRS|$IGNORE_FILES" >> "$output" 2>/dev/null
 
 echo -e "\n\n--- FILE CONTENTS ---" >> "$output"
-find . -type f \
-    -not -path '*/.*' \
-    -not -path '*/__pycache__*' \
-    -not -path './storage/*' \
-    -not -path './forensics/*.html' \
+
+# The logic below uses -prune to skip entire directory trees efficiently
+find . \
+    -type d -regextype posix-extended -regex ".*/$IGNORE_DIRS" -prune -o \
+    -type f \
+    -not -name 'glashaus_context.txt' \
     -not -name '*.pyc' \
-    -not -name 'cookies.txt' \
-    -not -name '*.sqlite' \
     -not -name '*.png' \
     -not -name '*.jpg' \
-    -not -name 'glashaus_context.txt' \
+    -not -name '*.svg' \
+    -not -name '*.sqlite' \
+    -not -name 'package-lock.json' \
     -not -path './scraper_service.py' \
     -not -path './manual_session_audit.py' \
-    | while read -r file; do
+    -print | while read -r file; do
     
     # Skip files larger than 50KB (likely raw data dumps/logs)
     # except for the main schema or specific logic files
